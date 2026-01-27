@@ -2,6 +2,8 @@
 
 A security-hardened web application for visualizing Nordic power grid energy data, designed to run behind your existing Nginx reverse proxy and Cloudflare, while also being accessible on your local LAN.
 
+<img width="1708" height="1152" alt="image" src="https://github.com/user-attachments/assets/c0e5c904-cae8-4497-943d-d25dd4763807" />
+
 ## Architecture
 
 ```
