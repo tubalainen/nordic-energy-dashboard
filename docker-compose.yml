@@ -1,0 +1,56 @@
+# Nordic Energy Dashboard - Hardened Docker Compose Configuration
+# Designed to run behind your existing Nginx reverse proxy + Cloudflare
+# Also accessible directly on LAN via port 5050
+
+services:
+  nordic-energy-dashboard:
+    build: .
+    container_name: nordic-energy-dashboard
+    restart: unless-stopped
+    ports:
+      # Accessible from LAN on port 5050
+      # Change to "127.0.0.1:5050:5000" if you want localhost-only access
+      - "5050:5000"
+    volumes:
+      - energy_data:/data
+    environment:
+      # Database
+      - DATABASE_PATH=/data/energy.db
+      # Data settings
+      - FETCH_INTERVAL=5
+      - DATA_RETENTION_DAYS=200
+      # Logging: Use INFO during setup, WARNING in production
+      - LOG_LEVEL=INFO
+      # Security: Disable debug endpoints in production
+      - ENABLE_DEBUG_ENDPOINTS=false
+      # Rate limiting (Flask-level, your nginx should also rate limit)
+      - RATE_LIMIT_DEFAULT=100 per minute
+      - RATE_LIMIT_API=30 per minute
+      # Timezone
+      - TZ=Europe/Stockholm
+    # Security: Read-only root filesystem
+    read_only: true
+    tmpfs:
+      - /tmp:size=10M
+      - /dev/shm:size=64M
+    # Security: Drop all capabilities
+    cap_drop:
+      - ALL
+    # Security: No new privileges
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/api/stats')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  energy_data:
+    name: nordic_energy_data

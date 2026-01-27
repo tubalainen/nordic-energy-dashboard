@@ -1,0 +1,16 @@
+# Nordic Energy Dashboard - Python Dependencies (Hardened)
+
+# Web framework
+Flask==3.0.0
+
+# Production WSGI server
+gunicorn==21.2.0
+
+# HTTP requests (for API calls)
+requests==2.31.0
+
+# Background task scheduler
+APScheduler==3.10.4
+
+# Rate limiting
+Flask-Limiter==3.5.0

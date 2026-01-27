@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nordic Energy Dashboard</title>
+    <link rel="stylesheet" href="/static/css/style.css?v=5">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
+</head>
+<body>
+    <div class="app-container">
+        <!-- Header -->
+        <header class="header">
+            <div class="header-content">
+                <div class="logo">
+                    <svg class="logo-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/>
+                    </svg>
+                    <h1>Nordic Energy Dashboard</h1>
+                </div>
+                <div class="header-stats" id="headerStats">
+                    <div class="stat-badge">
+                        <span class="stat-label">Last Update</span>
+                        <span class="stat-value" id="lastUpdate">--</span>
+                    </div>
+                    <div class="stat-badge">
+                        <span class="stat-label">Records</span>
+                        <span class="stat-value" id="totalRecords">--</span>
+                    </div>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Controls Panel -->
+            <section class="controls-panel">
+                <div class="control-group">
+                    <label class="control-label">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <circle cx="12" cy="12" r="10"/>
+                            <path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
+                        </svg>
+                        Select Countries
+                    </label>
+                    <div class="country-selector">
+                        {% for code, name in countries.items() %}
+                        <label class="country-chip">
+                            <input type="checkbox" name="country" value="{{ code }}" checked>
+                            <span class="chip-content">
+                                <span class="flag flag-{{ code|lower }}"></span>
+                                {{ name }}
+                            </span>
+                        </label>
+                        {% endfor %}
+                    </div>
+                </div>
+
+                <div class="control-group">
+                    <label class="control-label">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <rect x="3" y="4" width="18" height="18" rx="2" ry="2"/>
+                            <line x1="16" y1="2" x2="16" y2="6"/>
+                            <line x1="8" y1="2" x2="8" y2="6"/>
+                            <line x1="3" y1="10" x2="21" y2="10"/>
+                        </svg>
+                        Time Range
+                    </label>
+                    <div class="time-selector">
+                        <button class="time-btn" data-days="1">24h</button>
+                        <button class="time-btn" data-days="7">7 Days</button>
+                        <button class="time-btn active" data-days="30">30 Days</button>
+                        <button class="time-btn" data-days="90">90 Days</button>
+                        <button class="time-btn" data-days="180">6 Months</button>
+                    </div>
+                </div>
+
+                <button class="refresh-btn" id="refreshBtn">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <polyline points="23 4 23 10 17 10"/>
+                        <polyline points="1 20 1 14 7 14"/>
+                        <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+                    </svg>
+                    Refresh Data
+                </button>
+            </section>
+
+            <!-- Current Values Cards -->
+            <section class="current-values" id="currentValues">
+                <!-- Cards will be dynamically inserted here -->
+            </section>
+
+            <!-- Charts Section -->
+            <section class="charts-section">
+                <!-- Energy Status Chart -->
+                <div class="chart-card">
+                    <div class="chart-header">
+                        <h2>
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M18 20V10M12 20V4M6 20v-6"/>
+                            </svg>
+                            Energy Status
+                        </h2>
+                        <div class="chart-legend" id="statusLegend">
+                            <label class="legend-item">
+                                <input type="checkbox" data-type="production" checked>
+                                <span class="legend-color" style="background: #ef4444;"></span>
+                                Production
+                            </label>
+                            <label class="legend-item">
+                                <input type="checkbox" data-type="consumption" checked>
+                                <span class="legend-color" style="background: #22c55e;"></span>
+                                Consumption
+                            </label>
+                            <label class="legend-item">
+                                <input type="checkbox" data-type="import" checked>
+                                <span class="legend-color" style="background: #eab308;"></span>
+                                Import
+                            </label>
+                            <label class="legend-item">
+                                <input type="checkbox" data-type="export" checked>
+                                <span class="legend-color" style="background: #3b82f6;"></span>
+                                Export
+                            </label>
+                        </div>
+                    </div>
+                    <div class="chart-container">
+                        <canvas id="statusChart"></canvas>
+                    </div>
+                </div>
+
+                <!-- Energy Types Chart -->
+                <div class="chart-card">
+                    <div class="chart-header">
+                        <h2>
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
+                            </svg>
+                            Energy Types
+                        </h2>
+                        <div class="chart-legend" id="typesLegend">
+                            <label class="legend-item">
+                                <input type="checkbox" data-type="nuclear" checked>
+                                <span class="legend-color" style="background: #3b82f6;"></span>
+                                Nuclear
+                            </label>
+                            <label class="legend-item">
+                                <input type="checkbox" data-type="hydro" checked>
+                                <span class="legend-color" style="background: #ef4444;"></span>
+                                Hydro
+                            </label>
+                            <label class="legend-item">
+                                <input type="checkbox" data-type="wind" checked>
+                                <span class="legend-color" style="background: #eab308;"></span>
+                                Wind
+                            </label>
+                            <label class="legend-item">
+                                <input type="checkbox" data-type="thermal" checked>
+                                <span class="legend-color" style="background: #f97316;"></span>
+                                Thermal
+                            </label>
+                            <label class="legend-item">
+                                <input type="checkbox" data-type="not_specified" checked>
+                                <span class="legend-color" style="background: #8b5cf6;"></span>
+                                Other
+                            </label>
+                        </div>
+                    </div>
+                    <div class="chart-container">
+                        <canvas id="typesChart"></canvas>
+                    </div>
+                </div>
+            </section>
+        </main>
+
+        <!-- Footer -->
+        <footer class="footer">
+            <p>Data source: <a href="https://driftsdata.statnett.no" target="_blank">Statnett</a> | Nordic Power Grid Real-time Data</p>
+        </footer>
+    </div>
+
+    <!-- Loading Overlay -->
+    <div class="loading-overlay" id="loadingOverlay">
+        <div class="spinner"></div>
+        <p>Loading data...</p>
+    </div>
+
+    <script src="/static/js/app.js?v=5"></script>
+</body>
+</html>
