@@ -1,6 +1,8 @@
 # Nordic Energy Dashboard - Security Hardened Edition
 
-A security-hardened web application for visualizing Nordic power grid energy data, designed to run behind your existing Nginx reverse proxy and Cloudflare, while also being accessible on your local LAN.
+A security-hardened web application for visualizing Nordic power grid energy data provided via the public API from Statnett.no, designed to run behind your existing Nginx reverse proxy and Cloudflare, while also being accessible on your local LAN.
+
+<img width="802" height="1104" alt="image" src="https://github.com/user-attachments/assets/0ad689c0-f9c9-4a61-9a1b-e8593cdd1b50" />
 
 ## Architecture
 
