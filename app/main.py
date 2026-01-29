@@ -449,82 +449,84 @@ def fetch_and_store_data():
 # =============================================================================
 
 def fetch_and_store_prices():
-    """Fetch spot prices from Nordpool Elspot market (today + tomorrow)"""
+    """Fetch spot prices from Nordpool via hvakosterstrommen.no API (today + tomorrow)"""
     global last_price_fetch_time, last_price_fetch_status
 
     logger.info("Fetching spot prices from Nordpool...")
 
     try:
-        from nordpool import elspot
-        prices_spot = elspot.Prices()
+        import time as _time
+        from datetime import timezone as _tz
 
+        today = datetime.utcnow().date()
+        tomorrow = today + timedelta(days=1)
         all_zones = list(ZONE_TO_COUNTRY.keys())
-
-        # Fetch with end_date=tomorrow to ensure we get both today and tomorrow prices
-        tomorrow = datetime.utcnow().date() + timedelta(days=1)
-        result = prices_spot.hourly(end_date=tomorrow, areas=all_zones)
-
-        if not result or 'areas' not in result:
-            logger.warning("No price data returned from Nordpool")
-            last_price_fetch_status = "no_data"
-            last_price_fetch_time = datetime.utcnow()
-            return
-
-        currency = result.get('currency', 'EUR')
+        stored = 0
 
         with get_db() as conn:
             cursor = conn.cursor()
-            stored = 0
 
-            for zone_code, area_data in result['areas'].items():
-                if zone_code not in ZONE_TO_COUNTRY:
-                    continue
+            for fetch_date in [today, tomorrow]:
+                year = fetch_date.year
+                month_day = fetch_date.strftime('%m-%d')
 
-                country = ZONE_TO_COUNTRY[zone_code]
-                values = area_data.get('values', [])
-
-                for entry in values:
-                    start = entry.get('start')
-                    value = entry.get('value')
-
-                    if start is None or value is None:
-                        continue
-
-                    # Skip infinite or unreasonable values
+                for zone in all_zones:
                     try:
-                        price = float(value)
-                        if price != price or abs(price) > 1e6:
-                            continue
-                    except (TypeError, ValueError):
-                        continue
-
-                    # Convert to naive datetime for storage
-                    if hasattr(start, 'tzinfo') and start.tzinfo:
-                        import calendar
-                        timestamp = datetime.utcfromtimestamp(
-                            calendar.timegm(start.timetuple())
+                        url = (
+                            f'https://www.hvakosterstrommen.no/api/v1/prices/'
+                            f'{year}/{month_day}_{zone}.json'
                         )
-                    else:
-                        timestamp = start
+                        resp = requests.get(url, timeout=15)
 
-                    timestamp = timestamp.replace(second=0, microsecond=0)
+                        if resp.status_code == 404:
+                            # Tomorrow's prices not yet published – skip silently
+                            continue
 
-                    cursor.execute('''
-                        INSERT OR REPLACE INTO spot_prices
-                        (timestamp, country, zone, price, currency)
-                        VALUES (?, ?, ?, ?, ?)
-                    ''', (timestamp, country, zone_code, price, currency))
-                    stored += 1
+                        if resp.status_code != 200:
+                            logger.warning(
+                                f"Price API returned {resp.status_code} for {zone} on {fetch_date}"
+                            )
+                            continue
+
+                        entries = resp.json()
+                        country = ZONE_TO_COUNTRY[zone]
+
+                        for entry in entries:
+                            eur_per_kwh = entry.get('EUR_per_kWh')
+                            time_start = entry.get('time_start')
+
+                            if eur_per_kwh is None or time_start is None:
+                                continue
+
+                            price_mwh = float(eur_per_kwh) * 1000  # EUR/kWh → EUR/MWh
+
+                            if abs(price_mwh) > 1e6:
+                                continue
+
+                            # Parse CET/CEST timestamp → naive UTC
+                            ts = datetime.fromisoformat(time_start)
+                            ts_utc = ts.astimezone(_tz.utc).replace(tzinfo=None)
+                            ts_utc = ts_utc.replace(second=0, microsecond=0)
+
+                            cursor.execute('''
+                                INSERT OR REPLACE INTO spot_prices
+                                (timestamp, country, zone, price, currency)
+                                VALUES (?, ?, ?, ?, ?)
+                            ''', (ts_utc, country, zone, price_mwh, 'EUR'))
+                            stored += 1
+
+                        _time.sleep(0.1)  # polite rate-limiting between requests
+
+                    except Exception as zone_err:
+                        logger.warning(f"Failed to fetch prices for {zone} on {fetch_date}: {zone_err}")
+                        continue
 
             conn.commit()
-            last_price_fetch_time = datetime.utcnow()
-            last_price_fetch_status = "success"
-            logger.info(f"Stored {stored} price records")
 
-    except ImportError:
-        logger.error("nordpool package not installed - price fetching disabled")
-        last_price_fetch_status = "missing_package"
         last_price_fetch_time = datetime.utcnow()
+        last_price_fetch_status = "success"
+        logger.info(f"Stored {stored} price records")
+
     except Exception as e:
         last_price_fetch_time = datetime.utcnow()
         last_price_fetch_status = "error"
