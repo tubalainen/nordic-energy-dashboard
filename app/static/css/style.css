@@ -1,4 +1,4 @@
-/* Nordic Energy Dashboard - Modern Dark Theme v9 */
+/* Nordic Energy Dashboard - Modern Dark Theme v10 */
 
 :root {
     --bg-primary: #0f0f0f;
@@ -1126,6 +1126,77 @@ body {
 .correlation-badge.corr-strong-pos .corr-value { color: #ef4444; }
 
 /* =============================================================================
+   CURRENT SPOT PRICE TILE
+   ============================================================================= */
+
+.current-spot-price-tile {
+    background: var(--bg-card);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-lg);
+    padding: 1.5rem 2rem;
+    margin-bottom: 1.5rem;
+    text-align: center;
+    border-left: 4px solid var(--accent-cyan);
+    transition: var(--transition);
+}
+
+.current-spot-price-tile:hover {
+    border-color: var(--border-light);
+    transform: translateY(-2px);
+}
+
+.spot-price-header {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    margin-bottom: 0.75rem;
+}
+
+.spot-price-header svg {
+    width: 20px;
+    height: 20px;
+    color: var(--accent-cyan);
+}
+
+.spot-price-title {
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.spot-price-zone {
+    font-size: 0.8rem;
+    font-weight: 500;
+    color: var(--accent-cyan);
+    background: rgba(6, 182, 212, 0.15);
+    padding: 0.15rem 0.5rem;
+    border-radius: var(--radius-sm);
+}
+
+.spot-price-value {
+    font-size: 3rem;
+    font-weight: 700;
+    color: var(--accent-cyan);
+    line-height: 1.2;
+    margin-bottom: 0.25rem;
+}
+
+.spot-price-unit {
+    font-size: 0.9rem;
+    font-weight: 500;
+    color: var(--text-secondary);
+    margin-bottom: 0.5rem;
+}
+
+.spot-price-time {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+}
+
+/* =============================================================================
    RESPONSIVE UPDATES
    ============================================================================= */
 
@@ -1167,5 +1238,13 @@ body {
 
     .chart-container-scatter {
         height: 350px;
+    }
+
+    .spot-price-value {
+        font-size: 2rem;
+    }
+
+    .current-spot-price-tile {
+        padding: 1rem 1.25rem;
     }
 }

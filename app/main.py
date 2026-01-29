@@ -119,6 +119,16 @@ last_fetch_time = None
 last_fetch_status = None
 last_price_fetch_time = None
 last_price_fetch_status = None
+last_exchange_rate_fetch_time = None
+last_exchange_rate_fetch_status = None
+
+# Exchange rates (EUR base)
+exchange_rates = {
+    'EUR': 1.0,
+    'SEK': 11.0,   # Fallback defaults
+    'DKK': 7.45
+}
+VALID_CURRENCIES = frozenset(['EUR', 'SEK', 'DKK'])
 
 # =============================================================================
 # SECURITY MIDDLEWARE
@@ -439,7 +449,7 @@ def fetch_and_store_data():
 # =============================================================================
 
 def fetch_and_store_prices():
-    """Fetch spot prices from Nordpool Elspot market"""
+    """Fetch spot prices from Nordpool Elspot market (today + tomorrow)"""
     global last_price_fetch_time, last_price_fetch_status
 
     logger.info("Fetching spot prices from Nordpool...")
@@ -450,7 +460,9 @@ def fetch_and_store_prices():
 
         all_zones = list(ZONE_TO_COUNTRY.keys())
 
-        result = prices_spot.hourly(areas=all_zones)
+        # Fetch with end_date=tomorrow to ensure we get both today and tomorrow prices
+        tomorrow = datetime.utcnow().date() + timedelta(days=1)
+        result = prices_spot.hourly(end_date=tomorrow, areas=all_zones)
 
         if not result or 'areas' not in result:
             logger.warning("No price data returned from Nordpool")
@@ -527,6 +539,60 @@ def cleanup_old_data():
         cursor.execute('DELETE FROM energy_types WHERE timestamp < ?', (cutoff,))
         cursor.execute('DELETE FROM spot_prices WHERE timestamp < ?', (cutoff,))
         conn.commit()
+
+
+# =============================================================================
+# DATA FETCHING - EXCHANGE RATES
+# =============================================================================
+
+def fetch_exchange_rates():
+    """Fetch EUR->SEK and EUR->DKK exchange rates from Frankfurter API (ECB data)"""
+    global exchange_rates, last_exchange_rate_fetch_time, last_exchange_rate_fetch_status
+
+    logger.info("Fetching exchange rates...")
+
+    try:
+        response = requests.get(
+            'https://api.frankfurter.app/latest?from=EUR&to=SEK,DKK',
+            timeout=15
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        rates = data.get('rates', {})
+        if 'SEK' in rates:
+            exchange_rates['SEK'] = float(rates['SEK'])
+        if 'DKK' in rates:
+            exchange_rates['DKK'] = float(rates['DKK'])
+        exchange_rates['EUR'] = 1.0
+
+        last_exchange_rate_fetch_time = datetime.utcnow()
+        last_exchange_rate_fetch_status = "success"
+        logger.info(f"Exchange rates updated: EUR->SEK={exchange_rates['SEK']}, EUR->DKK={exchange_rates['DKK']}")
+
+    except Exception as e:
+        last_exchange_rate_fetch_time = datetime.utcnow()
+        last_exchange_rate_fetch_status = "error"
+        logger.error(f"Exchange rate fetch failed: {e}")
+
+
+def ensure_today_prices():
+    """Check if today's prices exist in DB; if not, trigger a fetch"""
+    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT COUNT(*) as count FROM spot_prices
+            WHERE timestamp >= ?
+        ''', (today_start,))
+        count = cursor.fetchone()['count']
+
+    if count == 0:
+        logger.info("No prices for today found, triggering price fetch...")
+        fetch_and_store_prices()
+        return True
+    return False
 
 
 # =============================================================================
@@ -683,6 +749,98 @@ def get_prices(country):
         'country_name': COUNTRIES.get(country),
         'zone': zone,
         'data': data
+    })
+
+
+@app.route('/api/prices/today/<country>')
+@limiter.limit(RATE_LIMIT_API)
+def get_today_prices(country):
+    """Return today's and tomorrow's hourly spot prices for a zone, with freshness check"""
+    country = validate_country_code(country)
+    if not country:
+        return jsonify({'error': 'Invalid country code'}), 400
+
+    zone = validate_zone(request.args.get('zone'), country)
+    if not zone:
+        zone = DEFAULT_ZONE.get(country, 'SE3')
+
+    # Ensure we have today's prices
+    ensure_today_prices()
+
+    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    tomorrow_start = today_start + timedelta(days=1)
+    day_after_tomorrow = tomorrow_start + timedelta(days=1)
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        # Get today's prices
+        cursor.execute('''
+            SELECT timestamp, price, currency, zone
+            FROM spot_prices WHERE zone = ? AND timestamp >= ? AND timestamp < ?
+            ORDER BY timestamp ASC
+        ''', (zone, today_start, tomorrow_start))
+        today_rows = cursor.fetchall()
+
+        # Get tomorrow's prices
+        cursor.execute('''
+            SELECT timestamp, price, currency, zone
+            FROM spot_prices WHERE zone = ? AND timestamp >= ? AND timestamp < ?
+            ORDER BY timestamp ASC
+        ''', (zone, tomorrow_start, day_after_tomorrow))
+        tomorrow_rows = cursor.fetchall()
+
+    def format_rows(rows):
+        result = []
+        for row in rows:
+            ts = row['timestamp']
+            if ts and 'T' not in ts:
+                ts = ts.replace(' ', 'T')
+            result.append({
+                'timestamp': ts,
+                'price': row['price'] or 0,
+                'currency': row['currency'] or 'EUR',
+                'zone': row['zone']
+            })
+        return result
+
+    # Find current price (closest hour <= now)
+    current_price = None
+    now = datetime.utcnow()
+    current_hour = now.replace(minute=0, second=0, microsecond=0)
+    for row in reversed(today_rows):
+        ts_str = row['timestamp']
+        ts = datetime.strptime(ts_str.replace('T', ' ').split('.')[0], '%Y-%m-%d %H:%M:%S') if ts_str else None
+        if ts and ts <= now:
+            current_price = {
+                'price': row['price'],
+                'currency': row['currency'] or 'EUR',
+                'timestamp': ts_str.replace(' ', 'T') if ts_str and 'T' not in ts_str else ts_str
+            }
+            break
+
+    return jsonify({
+        'country': country,
+        'country_name': COUNTRIES.get(country),
+        'zone': zone,
+        'today_date': today_start.strftime('%Y-%m-%d'),
+        'tomorrow_date': tomorrow_start.strftime('%Y-%m-%d'),
+        'today': format_rows(today_rows),
+        'tomorrow': format_rows(tomorrow_rows) if tomorrow_rows else None,
+        'current_price': current_price,
+        'has_tomorrow': len(tomorrow_rows) > 0
+    })
+
+
+@app.route('/api/exchange-rates')
+@limiter.limit(RATE_LIMIT_API)
+def get_exchange_rates():
+    """Return current exchange rates (EUR base)"""
+    return jsonify({
+        'base': 'EUR',
+        'rates': exchange_rates,
+        'last_updated': str(last_exchange_rate_fetch_time) if last_exchange_rate_fetch_time else None,
+        'status': last_exchange_rate_fetch_status
     })
 
 
@@ -966,7 +1124,10 @@ def get_debug():
         'last_fetch_time': str(last_fetch_time) if last_fetch_time else None,
         'last_fetch_status': last_fetch_status,
         'last_price_fetch_time': str(last_price_fetch_time) if last_price_fetch_time else None,
-        'last_price_fetch_status': last_price_fetch_status
+        'last_price_fetch_status': last_price_fetch_status,
+        'last_exchange_rate_fetch_time': str(last_exchange_rate_fetch_time) if last_exchange_rate_fetch_time else None,
+        'last_exchange_rate_fetch_status': last_exchange_rate_fetch_status,
+        'exchange_rates': exchange_rates
     })
 
 
@@ -1030,6 +1191,12 @@ def start_scheduler():
     except Exception as e:
         logger.error(f"Initial price fetch failed: {e}")
 
+    # Initial exchange rate fetch
+    try:
+        fetch_exchange_rates()
+    except Exception as e:
+        logger.error(f"Initial exchange rate fetch failed: {e}")
+
     scheduler.add_job(fetch_and_store_data, 'interval',
                       minutes=FETCH_INTERVAL_MINUTES, id='fetch_data',
                       replace_existing=True)
@@ -1039,11 +1206,16 @@ def start_scheduler():
                       hours=1, id='fetch_prices',
                       replace_existing=True)
 
+    # Exchange rates update 4 times a day (every 6 hours)
+    scheduler.add_job(fetch_exchange_rates, 'interval',
+                      hours=6, id='fetch_exchange_rates',
+                      replace_existing=True)
+
     scheduler.add_job(cleanup_old_data, 'cron', hour=3, minute=0, id='cleanup',
                       replace_existing=True)
 
     scheduler.start()
-    logger.info(f"Scheduler started - energy every {FETCH_INTERVAL_MINUTES} min, prices every 1 hour")
+    logger.info(f"Scheduler started - energy every {FETCH_INTERVAL_MINUTES} min, prices every 1 hour, exchange rates every 6 hours")
 
 
 # =============================================================================
