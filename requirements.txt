@@ -15,5 +15,4 @@ APScheduler==3.10.4
 # Rate limiting
 Flask-Limiter==3.5.0
 
-# Nordpool spot price data
-nordpool>=0.3
+# Nordpool prices fetched directly from dataportal API (no external library needed)
