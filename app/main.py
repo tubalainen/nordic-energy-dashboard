@@ -2,6 +2,7 @@
 """
 Nordic Energy Dashboard - Main Application (Hardened)
 Security-hardened version for production deployment
+Includes Nordpool spot price correlation analysis
 """
 
 import os
@@ -9,6 +10,7 @@ import sys
 import sqlite3
 import logging
 import re
+import math
 from datetime import datetime, timedelta
 from functools import wraps
 from flask import Flask, render_template, jsonify, request, abort
@@ -38,13 +40,36 @@ URL_CONSUMPTION = "https://driftsdata.statnett.no/restapi/ProductionConsumption/
 # Strict whitelist of allowed countries
 COUNTRIES = {
     "SE": "Sweden",
-    "NO": "Norway", 
+    "NO": "Norway",
     "FI": "Finland",
     "DK": "Denmark"
 }
 
 VALID_COUNTRY_CODES = frozenset(COUNTRIES.keys())
 MAX_DAYS = 200
+
+# Nordpool bidding zones per country
+COUNTRY_ZONES = {
+    'SE': ['SE1', 'SE2', 'SE3', 'SE4'],
+    'NO': ['NO1', 'NO2', 'NO3', 'NO4', 'NO5'],
+    'FI': ['FI'],
+    'DK': ['DK1', 'DK2']
+}
+
+DEFAULT_ZONE = {
+    'SE': 'SE3',
+    'NO': 'NO1',
+    'FI': 'FI',
+    'DK': 'DK1'
+}
+
+ZONE_TO_COUNTRY = {}
+for _country, _zones in COUNTRY_ZONES.items():
+    for _z in _zones:
+        ZONE_TO_COUNTRY[_z] = _country
+
+VALID_ZONES = frozenset(ZONE_TO_COUNTRY.keys())
+VALID_ENERGY_TYPES = frozenset(['nuclear', 'hydro', 'wind', 'thermal', 'not_specified'])
 
 # =============================================================================
 # LOGGING SETUP
@@ -64,7 +89,7 @@ logging.getLogger('werkzeug').setLevel(logging.WARNING)
 # FLASK APP SETUP
 # =============================================================================
 
-app = Flask(__name__, 
+app = Flask(__name__,
             template_folder='/app/templates',
             static_folder='/app/static')
 
@@ -92,6 +117,8 @@ limiter = Limiter(
 scheduler = None
 last_fetch_time = None
 last_fetch_status = None
+last_price_fetch_time = None
+last_price_fetch_status = None
 
 # =============================================================================
 # SECURITY MIDDLEWARE
@@ -105,7 +132,7 @@ def security_checks():
         if '..' in request.path or '//' in request.path:
             logger.warning(f"Blocked path traversal: {request.path} from {get_real_ip()}")
             abort(400)
-        
+
         # Block common exploit paths
         blocked_patterns = [
             r'\.php$', r'\.asp$', r'\.jsp$', r'\.cgi$',
@@ -126,7 +153,7 @@ def add_security_headers(response):
     response.headers['X-XSS-Protection'] = '1; mode=block'
     response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
     response.headers['Permissions-Policy'] = 'geolocation=(), microphone=(), camera=()'
-    
+
     csp = (
         "default-src 'self'; "
         "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
@@ -140,11 +167,11 @@ def add_security_headers(response):
     )
     response.headers['Content-Security-Policy'] = csp
     response.headers.pop('Server', None)
-    
+
     if request.path.startswith('/api/'):
         response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
         response.headers['Pragma'] = 'no-cache'
-    
+
     return response
 
 
@@ -183,6 +210,64 @@ def validate_days(days_str, default=7, max_days=MAX_DAYS):
         return default
 
 
+def validate_zone(zone_str, country=None):
+    """Validate and sanitize zone code"""
+    if not zone_str:
+        if country and country in DEFAULT_ZONE:
+            return DEFAULT_ZONE[country]
+        return None
+    zone = zone_str.upper().strip()
+    if zone not in VALID_ZONES:
+        return None
+    return zone
+
+
+def validate_energy_type(energy_type_str):
+    """Validate energy type parameter"""
+    if not energy_type_str:
+        return None
+    et = energy_type_str.lower().strip()
+    if et not in VALID_ENERGY_TYPES:
+        return None
+    return et
+
+
+# =============================================================================
+# STATISTICS HELPERS
+# =============================================================================
+
+def pearson_correlation(x, y):
+    """Calculate Pearson correlation coefficient between two lists"""
+    n = len(x)
+    if n < 3:
+        return None
+    mean_x = sum(x) / n
+    mean_y = sum(y) / n
+    numerator = sum((xi - mean_x) * (yi - mean_y) for xi, yi in zip(x, y))
+    denom_x = sum((xi - mean_x) ** 2 for xi in x)
+    denom_y = sum((yi - mean_y) ** 2 for yi in y)
+    if denom_x == 0 or denom_y == 0:
+        return None
+    return numerator / math.sqrt(denom_x * denom_y)
+
+
+def interpret_correlation(r):
+    """Return a human-readable interpretation of a correlation coefficient"""
+    if r is None:
+        return 'insufficient data'
+    abs_r = abs(r)
+    direction = 'negative' if r < 0 else 'positive'
+    if abs_r >= 0.7:
+        strength = 'strong'
+    elif abs_r >= 0.4:
+        strength = 'moderate'
+    elif abs_r >= 0.2:
+        strength = 'weak'
+    else:
+        strength = 'negligible'
+    return f"{strength} {direction}"
+
+
 # =============================================================================
 # DATABASE
 # =============================================================================
@@ -203,10 +288,10 @@ def get_db():
 def init_db():
     """Initialize the database"""
     os.makedirs(os.path.dirname(DATABASE_PATH), exist_ok=True)
-    
+
     with get_db() as conn:
         cursor = conn.cursor()
-        
+
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS energy_status (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -219,7 +304,7 @@ def init_db():
                 UNIQUE(timestamp, country)
             )
         ''')
-        
+
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS energy_types (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -233,18 +318,33 @@ def init_db():
                 UNIQUE(timestamp, country)
             )
         ''')
-        
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS spot_prices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp DATETIME NOT NULL,
+                country TEXT NOT NULL CHECK(country IN ('SE', 'NO', 'FI', 'DK')),
+                zone TEXT NOT NULL,
+                price REAL NOT NULL,
+                currency TEXT DEFAULT 'EUR',
+                UNIQUE(timestamp, zone)
+            )
+        ''')
+
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_status_ts ON energy_status(timestamp)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_status_country ON energy_status(country)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_types_ts ON energy_types(timestamp)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_types_country ON energy_types(country)')
-        
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_prices_ts ON spot_prices(timestamp)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_prices_zone ON spot_prices(zone)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_prices_country ON spot_prices(country)')
+
         conn.commit()
         logger.info("Database initialized")
 
 
 # =============================================================================
-# DATA FETCHING
+# DATA FETCHING - ENERGY
 # =============================================================================
 
 def get_item(collection, key, target):
@@ -268,43 +368,43 @@ def parse_value(value):
 def fetch_and_store_data():
     """Fetch data from Statnett API"""
     global last_fetch_time, last_fetch_status
-    
+
     logger.info("Fetching data from Statnett API...")
-    
+
     try:
         response = requests.get(URL_CONSUMPTION, timeout=30)
         response.raise_for_status()
         data = response.json()
-        
+
         timestamp = datetime.utcnow().replace(second=0, microsecond=0)
-        
+
         with get_db() as conn:
             cursor = conn.cursor()
-            
+
             for country_code in COUNTRIES.keys():
                 consumption = parse_value(
-                    get_item(data.get("ConsumptionData", []), "titleTranslationId", 
+                    get_item(data.get("ConsumptionData", []), "titleTranslationId",
                             f"ProductionConsumption.Consumption{country_code}Desc").get("value")
                 )
                 production = parse_value(
-                    get_item(data.get("ProductionData", []), "titleTranslationId", 
+                    get_item(data.get("ProductionData", []), "titleTranslationId",
                             f"ProductionConsumption.Production{country_code}Desc").get("value")
                 )
                 exchange = parse_value(
-                    get_item(data.get("NetExchangeData", []), "titleTranslationId", 
+                    get_item(data.get("NetExchangeData", []), "titleTranslationId",
                             f"ProductionConsumption.NetExchange{country_code}Desc").get("value")
                 )
-                
+
                 import_val = exchange / 1000 if exchange >= 0 else 0
                 export_val = abs(exchange) / 1000 if exchange < 0 else 0
-                
+
                 cursor.execute('''
-                    INSERT OR REPLACE INTO energy_status 
+                    INSERT OR REPLACE INTO energy_status
                     (timestamp, country, production, consumption, import_value, export_value)
                     VALUES (?, ?, ?, ?, ?, ?)
-                ''', (timestamp, country_code, production / 1000, consumption / 1000, 
+                ''', (timestamp, country_code, production / 1000, consumption / 1000,
                       import_val, export_val))
-                
+
                 nuclear = parse_value(get_item(data.get("NuclearData", []), "titleTranslationId",
                             f"ProductionConsumption.Nuclear{country_code}Desc").get("value"))
                 hydro = parse_value(get_item(data.get("HydroData", []), "titleTranslationId",
@@ -315,23 +415,108 @@ def fetch_and_store_data():
                             f"ProductionConsumption.Thermal{country_code}Desc").get("value"))
                 not_specified = parse_value(get_item(data.get("NotSpecifiedData", []), "titleTranslationId",
                             f"ProductionConsumption.NotSpecified{country_code}Desc").get("value"))
-                
+
                 cursor.execute('''
-                    INSERT OR REPLACE INTO energy_types 
+                    INSERT OR REPLACE INTO energy_types
                     (timestamp, country, nuclear, hydro, wind, thermal, not_specified)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
-                ''', (timestamp, country_code, nuclear / 1000, hydro / 1000, 
+                ''', (timestamp, country_code, nuclear / 1000, hydro / 1000,
                       wind / 1000, thermal / 1000, not_specified / 1000))
-            
+
             conn.commit()
             last_fetch_time = datetime.utcnow()
             last_fetch_status = "success"
             logger.info(f"Data stored for {timestamp}")
-            
+
     except Exception as e:
         last_fetch_time = datetime.utcnow()
         last_fetch_status = "error"
         logger.error(f"Fetch failed: {e}")
+
+
+# =============================================================================
+# DATA FETCHING - NORDPOOL SPOT PRICES
+# =============================================================================
+
+def fetch_and_store_prices():
+    """Fetch spot prices from Nordpool Elspot market"""
+    global last_price_fetch_time, last_price_fetch_status
+
+    logger.info("Fetching spot prices from Nordpool...")
+
+    try:
+        from nordpool import elspot
+        prices_spot = elspot.Prices()
+
+        all_zones = list(ZONE_TO_COUNTRY.keys())
+
+        result = prices_spot.hourly(areas=all_zones)
+
+        if not result or 'areas' not in result:
+            logger.warning("No price data returned from Nordpool")
+            last_price_fetch_status = "no_data"
+            last_price_fetch_time = datetime.utcnow()
+            return
+
+        currency = result.get('currency', 'EUR')
+
+        with get_db() as conn:
+            cursor = conn.cursor()
+            stored = 0
+
+            for zone_code, area_data in result['areas'].items():
+                if zone_code not in ZONE_TO_COUNTRY:
+                    continue
+
+                country = ZONE_TO_COUNTRY[zone_code]
+                values = area_data.get('values', [])
+
+                for entry in values:
+                    start = entry.get('start')
+                    value = entry.get('value')
+
+                    if start is None or value is None:
+                        continue
+
+                    # Skip infinite or unreasonable values
+                    try:
+                        price = float(value)
+                        if price != price or abs(price) > 1e6:
+                            continue
+                    except (TypeError, ValueError):
+                        continue
+
+                    # Convert to naive datetime for storage
+                    if hasattr(start, 'tzinfo') and start.tzinfo:
+                        import calendar
+                        timestamp = datetime.utcfromtimestamp(
+                            calendar.timegm(start.timetuple())
+                        )
+                    else:
+                        timestamp = start
+
+                    timestamp = timestamp.replace(second=0, microsecond=0)
+
+                    cursor.execute('''
+                        INSERT OR REPLACE INTO spot_prices
+                        (timestamp, country, zone, price, currency)
+                        VALUES (?, ?, ?, ?, ?)
+                    ''', (timestamp, country, zone_code, price, currency))
+                    stored += 1
+
+            conn.commit()
+            last_price_fetch_time = datetime.utcnow()
+            last_price_fetch_status = "success"
+            logger.info(f"Stored {stored} price records")
+
+    except ImportError:
+        logger.error("nordpool package not installed - price fetching disabled")
+        last_price_fetch_status = "missing_package"
+        last_price_fetch_time = datetime.utcnow()
+    except Exception as e:
+        last_price_fetch_time = datetime.utcnow()
+        last_price_fetch_status = "error"
+        logger.error(f"Price fetch failed: {e}")
 
 
 def cleanup_old_data():
@@ -340,6 +525,7 @@ def cleanup_old_data():
         cursor = conn.cursor()
         cursor.execute('DELETE FROM energy_status WHERE timestamp < ?', (cutoff,))
         cursor.execute('DELETE FROM energy_types WHERE timestamp < ?', (cutoff,))
+        cursor.execute('DELETE FROM spot_prices WHERE timestamp < ?', (cutoff,))
         conn.commit()
 
 
@@ -359,16 +545,29 @@ def get_countries():
     return jsonify(COUNTRIES)
 
 
+@app.route('/api/zones/<country>')
+@limiter.limit(RATE_LIMIT_API)
+def get_zones(country):
+    country = validate_country_code(country)
+    if not country:
+        return jsonify({'error': 'Invalid country code'}), 400
+    return jsonify({
+        'country': country,
+        'zones': COUNTRY_ZONES.get(country, []),
+        'default_zone': DEFAULT_ZONE.get(country)
+    })
+
+
 @app.route('/api/status/<country>')
 @limiter.limit(RATE_LIMIT_API)
 def get_status(country):
     country = validate_country_code(country)
     if not country:
         return jsonify({'error': 'Invalid country code'}), 400
-    
+
     days = validate_days(request.args.get('days'), default=7)
     start_date = datetime.utcnow() - timedelta(days=days)
-    
+
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute('''
@@ -377,7 +576,7 @@ def get_status(country):
             ORDER BY timestamp ASC LIMIT 10000
         ''', (country, start_date))
         rows = cursor.fetchall()
-    
+
     data = []
     for row in rows:
         ts = row['timestamp']
@@ -390,7 +589,7 @@ def get_status(country):
             'import': row['import_value'] or 0,
             'export': row['export_value'] or 0
         })
-        
+
     return jsonify({
         'country': country,
         'country_name': COUNTRIES.get(country),
@@ -404,10 +603,10 @@ def get_types(country):
     country = validate_country_code(country)
     if not country:
         return jsonify({'error': 'Invalid country code'}), 400
-    
+
     days = validate_days(request.args.get('days'), default=7)
     start_date = datetime.utcnow() - timedelta(days=days)
-    
+
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute('''
@@ -416,7 +615,7 @@ def get_types(country):
             ORDER BY timestamp ASC LIMIT 10000
         ''', (country, start_date))
         rows = cursor.fetchall()
-    
+
     data = []
     for row in rows:
         ts = row['timestamp']
@@ -430,7 +629,7 @@ def get_types(country):
             'thermal': row['thermal'] or 0,
             'not_specified': row['not_specified'] or 0
         })
-        
+
     return jsonify({
         'country': country,
         'country_name': COUNTRIES.get(country),
@@ -438,14 +637,236 @@ def get_types(country):
     })
 
 
+@app.route('/api/prices/<country>')
+@limiter.limit(RATE_LIMIT_API)
+def get_prices(country):
+    """Return spot price time series for a country/zone"""
+    country = validate_country_code(country)
+    if not country:
+        return jsonify({'error': 'Invalid country code'}), 400
+
+    days = validate_days(request.args.get('days'), default=7)
+    zone = validate_zone(request.args.get('zone'), country)
+    start_date = datetime.utcnow() - timedelta(days=days)
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        if zone:
+            cursor.execute('''
+                SELECT timestamp, price, currency, zone
+                FROM spot_prices WHERE country = ? AND zone = ? AND timestamp >= ?
+                ORDER BY timestamp ASC LIMIT 10000
+            ''', (country, zone, start_date))
+        else:
+            cursor.execute('''
+                SELECT timestamp, AVG(price) as price, currency, 'AVG' as zone
+                FROM spot_prices WHERE country = ? AND timestamp >= ?
+                GROUP BY timestamp
+                ORDER BY timestamp ASC LIMIT 10000
+            ''', (country, start_date))
+        rows = cursor.fetchall()
+
+    data = []
+    for row in rows:
+        ts = row['timestamp']
+        if ts and 'T' not in ts:
+            ts = ts.replace(' ', 'T')
+        data.append({
+            'timestamp': ts,
+            'price': row['price'] or 0,
+            'currency': row['currency'] or 'EUR',
+            'zone': row['zone']
+        })
+
+    return jsonify({
+        'country': country,
+        'country_name': COUNTRIES.get(country),
+        'zone': zone,
+        'data': data
+    })
+
+
+@app.route('/api/correlation/<country>')
+@limiter.limit(RATE_LIMIT_API)
+def get_correlation(country):
+    """Return paired price/energy data with correlation coefficient"""
+    country = validate_country_code(country)
+    if not country:
+        return jsonify({'error': 'Invalid country code'}), 400
+
+    energy_type = validate_energy_type(request.args.get('energy_type'))
+    if not energy_type:
+        energy_type = 'wind'
+
+    days = validate_days(request.args.get('days'), default=30)
+    zone = validate_zone(request.args.get('zone'), country)
+    if not zone:
+        zone = DEFAULT_ZONE.get(country, 'SE3')
+
+    start_date = datetime.utcnow() - timedelta(days=days)
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        # Get price data
+        cursor.execute('''
+            SELECT timestamp, price FROM spot_prices
+            WHERE zone = ? AND timestamp >= ?
+            ORDER BY timestamp ASC
+        ''', (zone, start_date))
+        price_rows = cursor.fetchall()
+
+        # Get energy type data aggregated to hourly
+        # energy_type is validated against VALID_ENERGY_TYPES whitelist
+        query = '''
+            SELECT strftime('%%Y-%%m-%%d %%H:00:00', timestamp) as hour_ts,
+                   AVG({col}) as energy_value
+            FROM energy_types
+            WHERE country = ? AND timestamp >= ?
+            GROUP BY hour_ts
+            ORDER BY hour_ts ASC
+        '''.format(col=energy_type)
+        cursor.execute(query, (country, start_date))
+        energy_rows = cursor.fetchall()
+
+    # Build energy lookup by hour
+    energy_by_hour = {}
+    for row in energy_rows:
+        energy_by_hour[row['hour_ts']] = row['energy_value']
+
+    # Pair data points
+    paired = []
+    prices_list = []
+    energy_list = []
+
+    for row in price_rows:
+        ts = row['timestamp']
+        hour_key = ts[:13] + ':00:00' if ts else None
+        if hour_key and hour_key in energy_by_hour:
+            price_val = row['price']
+            energy_val = energy_by_hour[hour_key]
+            if price_val is not None and energy_val is not None:
+                display_ts = ts
+                if display_ts and 'T' not in display_ts:
+                    display_ts = display_ts.replace(' ', 'T')
+                paired.append({
+                    'timestamp': display_ts,
+                    'price': price_val,
+                    'energy_value': energy_val
+                })
+                prices_list.append(price_val)
+                energy_list.append(energy_val)
+
+    r = pearson_correlation(energy_list, prices_list)
+    r_squared = r ** 2 if r is not None else None
+
+    return jsonify({
+        'country': country,
+        'country_name': COUNTRIES.get(country),
+        'zone': zone,
+        'energy_type': energy_type,
+        'days': days,
+        'data_points': len(paired),
+        'correlation': {
+            'r': round(r, 4) if r is not None else None,
+            'r_squared': round(r_squared, 4) if r_squared is not None else None,
+            'interpretation': interpret_correlation(r)
+        },
+        'data': paired
+    })
+
+
+@app.route('/api/correlation/summary/<country>')
+@limiter.limit(RATE_LIMIT_API)
+def get_correlation_summary(country):
+    """Return correlation coefficients for all energy types vs price"""
+    country = validate_country_code(country)
+    if not country:
+        return jsonify({'error': 'Invalid country code'}), 400
+
+    days = validate_days(request.args.get('days'), default=30)
+    zone = validate_zone(request.args.get('zone'), country)
+    if not zone:
+        zone = DEFAULT_ZONE.get(country, 'SE3')
+
+    start_date = datetime.utcnow() - timedelta(days=days)
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        # Get price data
+        cursor.execute('''
+            SELECT timestamp, price FROM spot_prices
+            WHERE zone = ? AND timestamp >= ?
+            ORDER BY timestamp ASC
+        ''', (zone, start_date))
+        price_rows = cursor.fetchall()
+
+        # Build price lookup by hour
+        price_by_hour = {}
+        for row in price_rows:
+            ts = row['timestamp']
+            hour_key = ts[:13] + ':00:00' if ts else None
+            if hour_key:
+                price_by_hour[hour_key] = row['price']
+
+        # Get energy types aggregated to hourly
+        cursor.execute('''
+            SELECT strftime('%%Y-%%m-%%d %%H:00:00', timestamp) as hour_ts,
+                   AVG(nuclear) as nuclear,
+                   AVG(hydro) as hydro,
+                   AVG(wind) as wind,
+                   AVG(thermal) as thermal,
+                   AVG(not_specified) as not_specified
+            FROM energy_types
+            WHERE country = ? AND timestamp >= ?
+            GROUP BY hour_ts
+            ORDER BY hour_ts ASC
+        ''', (country, start_date))
+        energy_rows = cursor.fetchall()
+
+    # Calculate correlations for each energy type
+    energy_types_list = ['nuclear', 'hydro', 'wind', 'thermal', 'not_specified']
+    results = {}
+
+    for et in energy_types_list:
+        prices_list = []
+        energy_list = []
+
+        for row in energy_rows:
+            hour_key = row['hour_ts']
+            if hour_key in price_by_hour:
+                price_val = price_by_hour[hour_key]
+                energy_val = row[et]
+                if price_val is not None and energy_val is not None:
+                    prices_list.append(price_val)
+                    energy_list.append(energy_val)
+
+        r = pearson_correlation(energy_list, prices_list)
+        results[et] = {
+            'r': round(r, 4) if r is not None else None,
+            'r_squared': round(r ** 2, 4) if r is not None else None,
+            'data_points': len(prices_list),
+            'interpretation': interpret_correlation(r)
+        }
+
+    return jsonify({
+        'country': country,
+        'country_name': COUNTRIES.get(country),
+        'zone': zone,
+        'days': days,
+        'correlations': results
+    })
+
+
 @app.route('/api/current')
 @limiter.limit(RATE_LIMIT_API)
 def get_current():
     result = {}
-    
+
     with get_db() as conn:
         cursor = conn.cursor()
-        
+
         for country_code in COUNTRIES.keys():
             cursor.execute('''
                 SELECT timestamp, production, consumption, import_value, export_value
@@ -453,16 +874,25 @@ def get_current():
                 ORDER BY timestamp DESC LIMIT 1
             ''', (country_code,))
             status = cursor.fetchone()
-            
+
             cursor.execute('''
                 SELECT nuclear, hydro, wind, thermal, not_specified
                 FROM energy_types WHERE country = ?
                 ORDER BY timestamp DESC LIMIT 1
             ''', (country_code,))
             types = cursor.fetchone()
-            
+
+            # Get latest spot price for default zone
+            default_z = DEFAULT_ZONE.get(country_code)
+            cursor.execute('''
+                SELECT price, currency, zone, timestamp
+                FROM spot_prices WHERE zone = ?
+                ORDER BY timestamp DESC LIMIT 1
+            ''', (default_z,))
+            price_row = cursor.fetchone()
+
             if status and types:
-                result[country_code] = {
+                entry = {
                     'name': COUNTRIES[country_code],
                     'timestamp': status['timestamp'],
                     'status': {
@@ -479,7 +909,15 @@ def get_current():
                         'not_specified': types['not_specified']
                     }
                 }
-    
+                if price_row:
+                    entry['price'] = {
+                        'value': price_row['price'],
+                        'currency': price_row['currency'],
+                        'zone': price_row['zone'],
+                        'timestamp': price_row['timestamp']
+                    }
+                result[country_code] = entry
+
     return jsonify(result)
 
 
@@ -490,11 +928,14 @@ def get_stats():
         cursor = conn.cursor()
         cursor.execute('SELECT COUNT(*) as count FROM energy_status')
         status_count = cursor.fetchone()['count']
+        cursor.execute('SELECT COUNT(*) as count FROM spot_prices')
+        price_count = cursor.fetchone()['count']
         cursor.execute('SELECT MAX(timestamp) as newest FROM energy_status')
         row = cursor.fetchone()
-        
+
     return jsonify({
         'total_records': status_count,
+        'price_records': price_count,
         'newest_record': row['newest']
     })
 
@@ -519,11 +960,13 @@ def health_check():
 def get_debug():
     if not ENABLE_DEBUG_ENDPOINTS:
         abort(404)
-    
+
     return jsonify({
         'scheduler_running': scheduler.running if scheduler else False,
         'last_fetch_time': str(last_fetch_time) if last_fetch_time else None,
-        'last_fetch_status': last_fetch_status
+        'last_fetch_status': last_fetch_status,
+        'last_price_fetch_time': str(last_price_fetch_time) if last_price_fetch_time else None,
+        'last_price_fetch_status': last_price_fetch_status
     })
 
 
@@ -533,6 +976,7 @@ def trigger_fetch():
     if not ENABLE_DEBUG_ENDPOINTS:
         abort(404)
     fetch_and_store_data()
+    fetch_and_store_prices()
     return jsonify({'success': True})
 
 
@@ -567,27 +1011,39 @@ def internal_error(e):
 
 def start_scheduler():
     global scheduler
-    
+
     if scheduler is not None and scheduler.running:
         logger.info("Scheduler already running, skipping start")
         return
-    
+
     scheduler = BackgroundScheduler(daemon=True)
-    
+
     # Initial data fetch
     try:
         fetch_and_store_data()
     except Exception as e:
         logger.error(f"Initial data fetch failed: {e}")
-    
-    scheduler.add_job(fetch_and_store_data, 'interval', 
+
+    # Initial price fetch
+    try:
+        fetch_and_store_prices()
+    except Exception as e:
+        logger.error(f"Initial price fetch failed: {e}")
+
+    scheduler.add_job(fetch_and_store_data, 'interval',
                       minutes=FETCH_INTERVAL_MINUTES, id='fetch_data',
                       replace_existing=True)
+
+    # Prices update hourly (day-ahead prices don't change that often)
+    scheduler.add_job(fetch_and_store_prices, 'interval',
+                      hours=1, id='fetch_prices',
+                      replace_existing=True)
+
     scheduler.add_job(cleanup_old_data, 'cron', hour=3, minute=0, id='cleanup',
                       replace_existing=True)
-    
+
     scheduler.start()
-    logger.info(f"Scheduler started - fetching every {FETCH_INTERVAL_MINUTES} min")
+    logger.info(f"Scheduler started - energy every {FETCH_INTERVAL_MINUTES} min, prices every 1 hour")
 
 
 # =============================================================================
