@@ -438,76 +438,93 @@ def fetch_and_store_data():
 # DATA FETCHING - NORDPOOL SPOT PRICES
 # =============================================================================
 
+def _store_price_result(cursor, result):
+    """Store price data from a Nordpool API result. Returns number of records stored."""
+    if not result or 'areas' not in result:
+        return 0
+
+    currency = result.get('currency', 'EUR')
+    stored = 0
+
+    for zone_code, area_data in result['areas'].items():
+        if zone_code not in ZONE_TO_COUNTRY:
+            continue
+
+        country = ZONE_TO_COUNTRY[zone_code]
+        values = area_data.get('values', [])
+
+        for entry in values:
+            start = entry.get('start')
+            value = entry.get('value')
+
+            if start is None or value is None:
+                continue
+
+            # Skip infinite or unreasonable values
+            try:
+                price = float(value)
+                if price != price or abs(price) > 1e6:
+                    continue
+            except (TypeError, ValueError):
+                continue
+
+            # Convert to naive datetime for storage
+            if hasattr(start, 'tzinfo') and start.tzinfo:
+                import calendar
+                timestamp = datetime.utcfromtimestamp(
+                    calendar.timegm(start.timetuple())
+                )
+            else:
+                timestamp = start
+
+            timestamp = timestamp.replace(second=0, microsecond=0)
+
+            cursor.execute('''
+                INSERT OR REPLACE INTO spot_prices
+                (timestamp, country, zone, price, currency)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (timestamp, country, zone_code, price, currency))
+            stored += 1
+
+    return stored
+
+
 def fetch_and_store_prices():
-    """Fetch spot prices from Nordpool Elspot market"""
+    """Fetch spot prices from Nordpool Elspot market for today and tomorrow"""
     global last_price_fetch_time, last_price_fetch_status
 
-    logger.info("Fetching spot prices from Nordpool...")
+    logger.info("Fetching spot prices from Nordpool (today + tomorrow)...")
 
     try:
         from nordpool import elspot
         prices_spot = elspot.Prices()
 
         all_zones = list(ZONE_TO_COUNTRY.keys())
-
-        result = prices_spot.hourly(areas=all_zones)
-
-        if not result or 'areas' not in result:
-            logger.warning("No price data returned from Nordpool")
-            last_price_fetch_status = "no_data"
-            last_price_fetch_time = datetime.utcnow()
-            return
-
-        currency = result.get('currency', 'EUR')
+        stored = 0
 
         with get_db() as conn:
             cursor = conn.cursor()
-            stored = 0
 
-            for zone_code, area_data in result['areas'].items():
-                if zone_code not in ZONE_TO_COUNTRY:
-                    continue
+            # Fetch today's prices
+            try:
+                result_today = prices_spot.hourly(areas=all_zones)
+                stored += _store_price_result(cursor, result_today)
+            except Exception as e:
+                logger.warning(f"Failed to fetch today's prices: {e}")
 
-                country = ZONE_TO_COUNTRY[zone_code]
-                values = area_data.get('values', [])
-
-                for entry in values:
-                    start = entry.get('start')
-                    value = entry.get('value')
-
-                    if start is None or value is None:
-                        continue
-
-                    # Skip infinite or unreasonable values
-                    try:
-                        price = float(value)
-                        if price != price or abs(price) > 1e6:
-                            continue
-                    except (TypeError, ValueError):
-                        continue
-
-                    # Convert to naive datetime for storage
-                    if hasattr(start, 'tzinfo') and start.tzinfo:
-                        import calendar
-                        timestamp = datetime.utcfromtimestamp(
-                            calendar.timegm(start.timetuple())
-                        )
-                    else:
-                        timestamp = start
-
-                    timestamp = timestamp.replace(second=0, microsecond=0)
-
-                    cursor.execute('''
-                        INSERT OR REPLACE INTO spot_prices
-                        (timestamp, country, zone, price, currency)
-                        VALUES (?, ?, ?, ?, ?)
-                    ''', (timestamp, country, zone_code, price, currency))
-                    stored += 1
+            # Fetch tomorrow's prices (available after ~13:00 CET)
+            try:
+                tomorrow = datetime.now() + timedelta(days=1)
+                result_tomorrow = prices_spot.hourly(areas=all_zones, end_date=tomorrow)
+                stored += _store_price_result(cursor, result_tomorrow)
+            except Exception as e:
+                logger.debug(f"Tomorrow's prices not yet available: {e}")
 
             conn.commit()
-            last_price_fetch_time = datetime.utcnow()
-            last_price_fetch_status = "success"
-            logger.info(f"Stored {stored} price records")
+
+        last_price_fetch_time = datetime.utcnow()
+        last_price_fetch_status = "success"
+        logger.info(f"Stored {stored} price records (today + tomorrow)")
 
     except ImportError:
         logger.error("nordpool package not installed - price fetching disabled")
@@ -684,6 +701,98 @@ def get_prices(country):
         'zone': zone,
         'data': data
     })
+
+
+@app.route('/api/prices/today/<country>')
+@limiter.limit(RATE_LIMIT_API)
+def get_prices_today(country):
+    """Return today's and tomorrow's hourly spot prices for a zone"""
+    country = validate_country_code(country)
+    if not country:
+        return jsonify({'error': 'Invalid country code'}), 400
+
+    zone = validate_zone(request.args.get('zone'), country)
+    if not zone:
+        zone = DEFAULT_ZONE.get(country, 'SE3')
+
+    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    day_after_tomorrow = today_start + timedelta(days=2)
+    tomorrow_start = today_start + timedelta(days=1)
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT timestamp, price, currency, zone
+            FROM spot_prices
+            WHERE zone = ? AND timestamp >= ? AND timestamp < ?
+            ORDER BY timestamp ASC
+        ''', (zone, today_start, day_after_tomorrow))
+        rows = cursor.fetchall()
+
+    now = datetime.utcnow()
+    current_hour = now.replace(minute=0, second=0, microsecond=0)
+    current_price = None
+    today_data = []
+    tomorrow_data = []
+
+    for row in rows:
+        ts_str = row['timestamp']
+        try:
+            ts = datetime.strptime(ts_str.replace('T', ' '), '%Y-%m-%d %H:%M:%S')
+        except (ValueError, AttributeError):
+            continue
+
+        display_ts = ts_str if 'T' in ts_str else ts_str.replace(' ', 'T')
+        entry = {
+            'timestamp': display_ts,
+            'price': row['price'],
+            'currency': row['currency'] or 'EUR',
+            'hour': ts.strftime('%H:%M')
+        }
+
+        if ts < tomorrow_start:
+            today_data.append(entry)
+            if ts == current_hour:
+                current_price = row['price']
+        else:
+            tomorrow_data.append(entry)
+
+    return jsonify({
+        'country': country,
+        'country_name': COUNTRIES.get(country),
+        'zone': zone,
+        'current_price': current_price,
+        'current_hour': current_hour.strftime('%H:%M'),
+        'today': today_data,
+        'tomorrow': tomorrow_data,
+        'has_tomorrow': len(tomorrow_data) > 0
+    })
+
+
+@app.route('/api/prices/ensure-fresh')
+@limiter.limit("10 per minute")
+def ensure_fresh_prices():
+    """Check if today's prices exist in DB, fetch if not. Called on page load."""
+    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT COUNT(*) as count FROM spot_prices
+            WHERE timestamp >= ?
+        ''', (today_start,))
+        count = cursor.fetchone()['count']
+
+    if count == 0:
+        # No prices for today yet - trigger a fetch
+        try:
+            fetch_and_store_prices()
+            return jsonify({'status': 'fetched', 'message': 'Prices fetched successfully'})
+        except Exception as e:
+            logger.error(f"On-demand price fetch failed: {e}")
+            return jsonify({'status': 'error', 'message': 'Failed to fetch prices'}), 500
+
+    return jsonify({'status': 'fresh', 'count': count})
 
 
 @app.route('/api/correlation/<country>')

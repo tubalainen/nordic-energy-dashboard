@@ -1,4 +1,4 @@
-/* Nordic Energy Dashboard - Modern Dark Theme v9 */
+/* Nordic Energy Dashboard - Modern Dark Theme v10 */
 
 :root {
     --bg-primary: #0f0f0f;
@@ -965,6 +965,61 @@ body {
     color: var(--accent-cyan);
 }
 
+/* Current Spot Price Tile */
+.current-price-tile {
+    background: var(--bg-card);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-lg);
+    padding: 1.5rem 2rem;
+    margin-bottom: 1.5rem;
+    text-align: center;
+    border-left: 4px solid var(--accent-cyan);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+
+.price-tile-header {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 1rem;
+    margin-bottom: 0.75rem;
+}
+
+.price-tile-header h3 {
+    font-size: 1rem;
+    font-weight: 500;
+    color: var(--text-secondary);
+}
+
+.price-tile-zone {
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: var(--accent-cyan);
+    background: rgba(6, 182, 212, 0.15);
+    padding: 0.25rem 0.75rem;
+    border-radius: var(--radius-sm);
+}
+
+.price-tile-value {
+    font-size: 3rem;
+    font-weight: 700;
+    color: var(--accent-cyan);
+    line-height: 1.2;
+}
+
+.price-tile-unit {
+    font-size: 0.85rem;
+    color: var(--text-muted);
+    margin-bottom: 0.5rem;
+}
+
+.price-tile-time {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+}
+
 /* Correlation Controls */
 .correlation-controls {
     display: flex;
@@ -1154,6 +1209,14 @@ body {
     .modal-content {
         margin: 1rem;
         width: calc(100% - 2rem);
+    }
+
+    .current-price-tile {
+        padding: 1.25rem 1rem;
+    }
+
+    .price-tile-value {
+        font-size: 2.25rem;
     }
 
     .correlation-controls {

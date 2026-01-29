@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Nordic Energy Dashboard</title>
-    <link rel="stylesheet" href="/static/css/style.css?v=9">
+    <link rel="stylesheet" href="/static/css/style.css?v=10">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
@@ -268,6 +268,34 @@
                         </div>
                     </div>
 
+                    <!-- Current Spot Price Tile -->
+                    <div class="current-price-tile" id="currentPriceTile">
+                        <div class="price-tile-header">
+                            <h3>Current Spot Price</h3>
+                            <span class="price-tile-zone" id="currentPriceZone">--</span>
+                        </div>
+                        <div class="price-tile-value" id="currentPriceValue">--</div>
+                        <div class="price-tile-unit">EUR/MWh</div>
+                        <div class="price-tile-time" id="currentPriceTime">--</div>
+                    </div>
+
+                    <!-- Today's & Tomorrow's Prices Chart -->
+                    <div class="chart-card">
+                        <div class="chart-header">
+                            <h2>
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <circle cx="12" cy="12" r="10"></circle>
+                                    <polyline points="12 6 12 12 16 14"></polyline>
+                                </svg>
+                                Today's &amp; Tomorrow's Prices
+                            </h2>
+                            <span class="chart-subtitle" id="todayPriceChartSubtitle">Hourly spot prices</span>
+                        </div>
+                        <div class="chart-container">
+                            <canvas id="todayPriceChart"></canvas>
+                        </div>
+                    </div>
+
                     <!-- Correlation Summary Cards -->
                     <div class="correlation-summary" id="correlationSummary">
                         <!-- Cards injected by JS -->
@@ -344,6 +372,6 @@
         <p>Loading data...</p>
     </div>
 
-    <script src="/static/js/app.js?v=9"></script>
+    <script src="/static/js/app.js?v=10"></script>
 </body>
 </html>

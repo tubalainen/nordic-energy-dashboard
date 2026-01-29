@@ -1,6 +1,6 @@
 /**
  * Nordic Energy Dashboard - Frontend Application
- * Version 9 - Added Nordpool spot price correlation analysis
+ * Version 10 - Today/tomorrow price chart, current price tile, ensure-fresh on load
  */
 
 // =============================================================================
@@ -46,6 +46,7 @@ let currentData = {};
 let priceChart = null;
 let correlationChart = null;
 let scatterChart = null;
+let todayPriceChart = null;
 let selectedZone = null;
 let selectedEnergyType = 'wind';
 let countryZones = {};
@@ -184,15 +185,21 @@ const pieChartOptions = {
 // INITIALIZATION
 // =============================================================================
 
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
     console.log('DOM loaded, initializing dashboard...');
     initializeControls();
     initializeCharts();
     initializeCorrelationCharts();
+    initializeTodayPriceChart();
     initializeSettingsModal();
     initializeCorrelationControls();
+
+    // Ensure today's prices are fetched before loading data
+    await ensureFreshPrices();
+
     loadData();
     loadStats();
+    loadTodayPrices();
 });
 
 function initializeControls() {
@@ -209,6 +216,7 @@ function initializeControls() {
             loadData();
             updateZoneSelector();
             loadCorrelationData();
+            loadTodayPrices();
         });
     });
 
@@ -226,10 +234,12 @@ function initializeControls() {
         });
     });
 
-    document.getElementById('refreshBtn').addEventListener('click', () => {
+    document.getElementById('refreshBtn').addEventListener('click', async () => {
+        await ensureFreshPrices();
         loadData();
         loadStats();
         loadCorrelationData();
+        loadTodayPrices();
     });
 
     document.querySelectorAll('#statusLegend input').forEach(checkbox => {
@@ -362,6 +372,7 @@ function initializeCorrelationControls() {
     zoneSelector.addEventListener('change', (e) => {
         selectedZone = e.target.value;
         loadCorrelationData();
+        loadTodayPrices();
     });
 
     energyTypeSelector.addEventListener('change', (e) => {
@@ -396,6 +407,175 @@ async function updateZoneSelector() {
         selectedZone = zoneSelector.value;
     } catch (err) {
         console.error('Failed to load zones:', err);
+    }
+}
+
+// =============================================================================
+// TODAY/TOMORROW PRICE CHART & CURRENT PRICE TILE
+// =============================================================================
+
+function initializeTodayPriceChart() {
+    const ctx = document.getElementById('todayPriceChart').getContext('2d');
+    todayPriceChart = new Chart(ctx, {
+        type: 'line',
+        data: { datasets: [] },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: { mode: 'index', intersect: false },
+            plugins: {
+                legend: { display: true, position: 'top', labels: { color: '#a0a0a0', padding: 15 } },
+                datalabels: { display: false },
+                tooltip: {
+                    backgroundColor: 'rgba(30, 30, 30, 0.95)',
+                    titleColor: '#ffffff', bodyColor: '#a0a0a0',
+                    borderColor: '#333333', borderWidth: 1, padding: 12,
+                    displayColors: true,
+                    callbacks: {
+                        label: function(context) {
+                            return `${context.dataset.label}: ${context.parsed.y?.toFixed(2) || 0} EUR/MWh`;
+                        }
+                    }
+                }
+            },
+            scales: {
+                x: {
+                    type: 'time',
+                    time: { unit: 'hour', displayFormats: { hour: 'HH:mm' } },
+                    grid: { color: '#252525', drawBorder: false },
+                    ticks: { maxTicksLimit: 24 }
+                },
+                y: {
+                    beginAtZero: false,
+                    grid: { color: '#252525', drawBorder: false },
+                    ticks: {
+                        callback: function(value) { return value.toFixed(0) + ' EUR'; }
+                    }
+                }
+            }
+        }
+    });
+}
+
+async function ensureFreshPrices() {
+    try {
+        const response = await fetch('/api/prices/ensure-fresh');
+        if (response.ok) {
+            const data = await response.json();
+            if (data.status === 'fetched') {
+                console.log('Fresh prices fetched from Nordpool');
+            }
+        }
+    } catch (err) {
+        console.warn('Failed to ensure fresh prices:', err);
+    }
+}
+
+async function loadTodayPrices() {
+    const country = selectedCountries[0] || 'SE';
+    const zone = selectedZone || '';
+
+    try {
+        const response = await fetch(`/api/prices/today/${country}?zone=${zone}`);
+        if (!response.ok) return;
+        const data = await response.json();
+
+        updateTodayPriceChart(data);
+        updateCurrentPriceTile(data);
+    } catch (err) {
+        console.error('Failed to load today prices:', err);
+    }
+}
+
+function updateTodayPriceChart(data) {
+    const datasets = [];
+
+    if (data.today && data.today.length > 0) {
+        const todayPoints = [];
+        const now = new Date();
+        const currentHourUTC = now.getUTCHours();
+        const pointRadii = [];
+        const pointBgColors = [];
+
+        for (const d of data.today) {
+            const date = parseTimestamp(d.timestamp);
+            if (!date) continue;
+            todayPoints.push({ x: date, y: d.price });
+
+            // Highlight the current hour
+            if (date.getUTCHours() === currentHourUTC) {
+                pointRadii.push(8);
+                pointBgColors.push('#06b6d4');
+            } else {
+                pointRadii.push(4);
+                pointBgColors.push('rgba(6, 182, 212, 0.6)');
+            }
+        }
+
+        datasets.push({
+            label: 'Today',
+            data: todayPoints,
+            borderColor: '#06b6d4',
+            backgroundColor: 'rgba(6, 182, 212, 0.15)',
+            borderWidth: 2,
+            tension: 0.3,
+            pointRadius: pointRadii,
+            pointBackgroundColor: pointBgColors,
+            pointHoverRadius: 7,
+            fill: true
+        });
+    }
+
+    if (data.tomorrow && data.tomorrow.length > 0) {
+        const tomorrowPoints = [];
+        for (const d of data.tomorrow) {
+            const date = parseTimestamp(d.timestamp);
+            if (date) tomorrowPoints.push({ x: date, y: d.price });
+        }
+
+        datasets.push({
+            label: 'Tomorrow',
+            data: tomorrowPoints,
+            borderColor: '#8b5cf6',
+            backgroundColor: 'rgba(139, 92, 246, 0.1)',
+            borderWidth: 2,
+            borderDash: [6, 3],
+            tension: 0.3,
+            pointRadius: 4,
+            pointHoverRadius: 6,
+            fill: true
+        });
+    }
+
+    if (datasets.length === 0) {
+        todayPriceChart.data.datasets = [];
+        todayPriceChart.update('none');
+        document.getElementById('todayPriceChartSubtitle').textContent = 'No price data available for today';
+        return;
+    }
+
+    todayPriceChart.data.datasets = datasets;
+    todayPriceChart.options.scales.x.time.unit = 'hour';
+    todayPriceChart.update('none');
+
+    let subtitle = `${data.zone} | ${data.country_name}`;
+    if (data.has_tomorrow) subtitle += ' | Tomorrow available';
+    document.getElementById('todayPriceChartSubtitle').textContent = subtitle;
+}
+
+function updateCurrentPriceTile(data) {
+    const priceEl = document.getElementById('currentPriceValue');
+    const zoneEl = document.getElementById('currentPriceZone');
+    const timeEl = document.getElementById('currentPriceTime');
+
+    zoneEl.textContent = data.zone || '--';
+
+    if (data.current_price !== null && data.current_price !== undefined) {
+        priceEl.textContent = data.current_price.toFixed(2);
+        timeEl.textContent = `Current hour: ${data.current_hour} UTC`;
+    } else {
+        priceEl.textContent = '--';
+        timeEl.textContent = 'No data for current hour';
     }
 }
 
@@ -1048,4 +1228,4 @@ setInterval(() => {
     loadStats();
 }, 5 * 60 * 1000);
 
-console.log('Nordic Energy Dashboard v9 loaded (with Nordpool correlation)');
+console.log('Nordic Energy Dashboard v10 loaded (today/tomorrow prices + ensure-fresh)');
