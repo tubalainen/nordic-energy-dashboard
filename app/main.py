@@ -448,83 +448,121 @@ def fetch_and_store_data():
 # DATA FETCHING - NORDPOOL SPOT PRICES
 # =============================================================================
 
+NORDPOOL_API_URL = "https://dataportal-api.nordpoolgroup.com/api/DayAheadPrices"
+NORDPOOL_API_TIMEOUT = 15
+NORDPOOL_API_RETRIES = 3
+
+
+def _fetch_nordpool_day(target_date, zones):
+    """Fetch day-ahead prices from Nordpool API for a single date.
+    Returns list of (timestamp_str, zone, price) tuples, or empty list on failure."""
+    params = {
+        'currency': 'EUR',
+        'market': 'DayAhead',
+        'date': target_date.strftime('%Y-%m-%d'),
+        'deliveryArea': ','.join(zones),
+    }
+
+    last_err = None
+    for attempt in range(NORDPOOL_API_RETRIES):
+        try:
+            resp = requests.get(
+                NORDPOOL_API_URL,
+                params=params,
+                timeout=NORDPOOL_API_TIMEOUT,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            break
+        except Exception as e:
+            last_err = e
+            if attempt < NORDPOOL_API_RETRIES - 1:
+                import time
+                time.sleep(2 ** attempt)
+                logger.warning(f"Nordpool API attempt {attempt + 1} failed: {e}, retrying...")
+            continue
+    else:
+        logger.error(f"Nordpool API failed after {NORDPOOL_API_RETRIES} attempts: {last_err}")
+        return []
+
+    results = []
+    # multiAreaEntries contains 15-min intervals; aggregate to hourly by
+    # keeping the first 15-min price of each hour (prices are constant within
+    # an hour for day-ahead auction).
+    seen_hours = {}  # (zone, hour_start) -> True
+    for entry in data.get('multiAreaEntries', []):
+        delivery_start = entry.get('deliveryStart')
+        if not delivery_start:
+            continue
+        for zone, price in entry.get('entryPerArea', {}).items():
+            if zone not in zones:
+                continue
+            # Parse ISO timestamp and truncate to hour
+            try:
+                dt = datetime.fromisoformat(delivery_start.replace('Z', '+00:00'))
+                hour_start = dt.replace(minute=0, second=0, microsecond=0)
+            except (ValueError, AttributeError):
+                continue
+            key = (zone, hour_start)
+            if key in seen_hours:
+                continue
+            seen_hours[key] = True
+            try:
+                price_val = float(price)
+                if price_val != price_val or abs(price_val) > 1e6:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            # Store as naive UTC datetime
+            naive_utc = hour_start.replace(tzinfo=None)
+            results.append((naive_utc, zone, price_val))
+
+    return results
+
+
 def fetch_and_store_prices():
-    """Fetch spot prices from Nordpool Elspot market (today + tomorrow)"""
+    """Fetch spot prices from Nordpool day-ahead market (today + tomorrow)"""
     global last_price_fetch_time, last_price_fetch_status
 
     logger.info("Fetching spot prices from Nordpool...")
 
     try:
-        from nordpool import elspot
-        prices_spot = elspot.Prices()
-
         all_zones = list(ZONE_TO_COUNTRY.keys())
+        today = datetime.utcnow().date()
+        tomorrow = today + timedelta(days=1)
 
-        # Fetch with end_date=tomorrow to ensure we get both today and tomorrow prices
-        tomorrow = datetime.utcnow().date() + timedelta(days=1)
-        result = prices_spot.hourly(end_date=tomorrow, areas=all_zones)
+        all_results = []
+        for target_date in [today, tomorrow]:
+            day_results = _fetch_nordpool_day(target_date, all_zones)
+            all_results.extend(day_results)
 
-        if not result or 'areas' not in result:
+        if not all_results:
             logger.warning("No price data returned from Nordpool")
             last_price_fetch_status = "no_data"
             last_price_fetch_time = datetime.utcnow()
             return
 
-        currency = result.get('currency', 'EUR')
-
         with get_db() as conn:
             cursor = conn.cursor()
             stored = 0
 
-            for zone_code, area_data in result['areas'].items():
-                if zone_code not in ZONE_TO_COUNTRY:
+            for timestamp, zone_code, price in all_results:
+                country = ZONE_TO_COUNTRY.get(zone_code)
+                if not country:
                     continue
 
-                country = ZONE_TO_COUNTRY[zone_code]
-                values = area_data.get('values', [])
-
-                for entry in values:
-                    start = entry.get('start')
-                    value = entry.get('value')
-
-                    if start is None or value is None:
-                        continue
-
-                    # Skip infinite or unreasonable values
-                    try:
-                        price = float(value)
-                        if price != price or abs(price) > 1e6:
-                            continue
-                    except (TypeError, ValueError):
-                        continue
-
-                    # Convert to naive datetime for storage
-                    if hasattr(start, 'tzinfo') and start.tzinfo:
-                        import calendar
-                        timestamp = datetime.utcfromtimestamp(
-                            calendar.timegm(start.timetuple())
-                        )
-                    else:
-                        timestamp = start
-
-                    timestamp = timestamp.replace(second=0, microsecond=0)
-
-                    cursor.execute('''
-                        INSERT OR REPLACE INTO spot_prices
-                        (timestamp, country, zone, price, currency)
-                        VALUES (?, ?, ?, ?, ?)
-                    ''', (timestamp, country, zone_code, price, currency))
-                    stored += 1
+                cursor.execute('''
+                    INSERT OR REPLACE INTO spot_prices
+                    (timestamp, country, zone, price, currency)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (timestamp, country, zone_code, price, 'EUR'))
+                stored += 1
 
             conn.commit()
             last_price_fetch_time = datetime.utcnow()
             last_price_fetch_status = "success"
             logger.info(f"Stored {stored} price records")
 
-    except ImportError:
-        logger.error("nordpool package not installed - price fetching disabled")
-        last_price_fetch_status = "missing_package"
-        last_price_fetch_time = datetime.utcnow()
     except Exception as e:
         last_price_fetch_time = datetime.utcnow()
         last_price_fetch_status = "error"
