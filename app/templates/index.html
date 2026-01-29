@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Nordic Energy Dashboard</title>
-    <link rel="stylesheet" href="/static/css/style.css?v=9">
+    <link rel="stylesheet" href="/static/css/style.css?v=10">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
@@ -266,6 +266,54 @@
                                 <option value="not_specified">Other</option>
                             </select>
                         </div>
+                        <div class="control-group">
+                            <label class="control-label">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <line x1="12" y1="1" x2="12" y2="23"></line>
+                                    <path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path>
+                                </svg>
+                                Currency
+                            </label>
+                            <select id="currencySelector" class="control-select">
+                                <option value="SEK">SEK</option>
+                                <option value="EUR">EUR</option>
+                                <option value="DKK">DKK</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <!-- Current Spot Price Tile -->
+                    <div class="current-spot-price-tile" id="currentSpotPriceTile">
+                        <div class="spot-price-header">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <line x1="12" y1="1" x2="12" y2="23"></line>
+                                <path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path>
+                            </svg>
+                            <span class="spot-price-title">Current Spot Price</span>
+                            <span class="spot-price-zone" id="spotPriceZone">--</span>
+                        </div>
+                        <div class="spot-price-value" id="spotPriceValue">--</div>
+                        <div class="spot-price-unit" id="spotPriceUnit">EUR/MWh</div>
+                        <div class="spot-price-time" id="spotPriceTime">--</div>
+                    </div>
+
+                    <!-- Today & Tomorrow Price Chart -->
+                    <div class="chart-card">
+                        <div class="chart-header">
+                            <h2>
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <rect x="3" y="4" width="18" height="18" rx="2" ry="2"/>
+                                    <line x1="16" y1="2" x2="16" y2="6"/>
+                                    <line x1="8" y1="2" x2="8" y2="6"/>
+                                    <line x1="3" y1="10" x2="21" y2="10"/>
+                                </svg>
+                                Today &amp; Tomorrow Prices
+                            </h2>
+                            <span class="chart-subtitle" id="todayPriceChartSubtitle">Hourly spot prices</span>
+                        </div>
+                        <div class="chart-container">
+                            <canvas id="todayPriceChart"></canvas>
+                        </div>
                     </div>
 
                     <!-- Correlation Summary Cards -->
@@ -273,7 +321,7 @@
                         <!-- Cards injected by JS -->
                     </div>
 
-                    <!-- Spot Price Chart -->
+                    <!-- Spot Price Chart (historical) -->
                     <div class="chart-card">
                         <div class="chart-header">
                             <h2>
@@ -281,7 +329,7 @@
                                     <line x1="12" y1="1" x2="12" y2="23"></line>
                                     <path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path>
                                 </svg>
-                                Spot Price
+                                Spot Price (Historical)
                             </h2>
                             <span class="chart-subtitle" id="priceChartSubtitle">EUR/MWh</span>
                         </div>
@@ -344,6 +392,6 @@
         <p>Loading data...</p>
     </div>
 
-    <script src="/static/js/app.js?v=9"></script>
+    <script src="/static/js/app.js?v=10"></script>
 </body>
 </html>

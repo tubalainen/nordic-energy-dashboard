@@ -1,6 +1,6 @@
 /**
  * Nordic Energy Dashboard - Frontend Application
- * Version 9 - Added Nordpool spot price correlation analysis
+ * Version 10 - Today/tomorrow prices, currency selection, current spot price tile
  */
 
 // =============================================================================
@@ -9,7 +9,8 @@
 
 const DEFAULT_SETTINGS = {
     defaultCountry: 'SE',
-    defaultDays: 30
+    defaultDays: 30,
+    defaultCurrency: 'SEK'
 };
 
 function loadSettings() {
@@ -46,9 +47,14 @@ let currentData = {};
 let priceChart = null;
 let correlationChart = null;
 let scatterChart = null;
+let todayPriceChart = null;
 let selectedZone = null;
 let selectedEnergyType = 'wind';
 let countryZones = {};
+
+// Currency & exchange rate state
+let selectedCurrency = settings.defaultCurrency || 'SEK';
+let exchangeRates = { EUR: 1.0, SEK: 11.0, DKK: 7.45 };
 
 // =============================================================================
 // COLOR SCHEMES
@@ -70,6 +76,7 @@ const typeColors = {
 };
 
 const priceColor = { border: '#06b6d4', background: 'rgba(6, 182, 212, 0.2)' };
+const tomorrowPriceColor = { border: '#a78bfa', background: 'rgba(167, 139, 250, 0.2)' };
 
 const countryStyles = {
     SE: { name: 'Sweden',  lineStyle: [],             borderWidth: 2 },
@@ -189,10 +196,14 @@ document.addEventListener('DOMContentLoaded', () => {
     initializeControls();
     initializeCharts();
     initializeCorrelationCharts();
+    initializeTodayPriceChart();
     initializeSettingsModal();
     initializeCorrelationControls();
-    loadData();
-    loadStats();
+    initializeCurrencySelector();
+    fetchExchangeRates().then(() => {
+        loadData();
+        loadStats();
+    });
 });
 
 function initializeControls() {
@@ -362,6 +373,7 @@ function initializeCorrelationControls() {
     zoneSelector.addEventListener('change', (e) => {
         selectedZone = e.target.value;
         loadCorrelationData();
+        loadTodayPrices();
     });
 
     energyTypeSelector.addEventListener('change', (e) => {
@@ -396,6 +408,219 @@ async function updateZoneSelector() {
         selectedZone = zoneSelector.value;
     } catch (err) {
         console.error('Failed to load zones:', err);
+    }
+}
+
+// =============================================================================
+// CURRENCY & EXCHANGE RATES
+// =============================================================================
+
+function convertPrice(priceEur, currency) {
+    if (!currency || currency === 'EUR') return priceEur;
+    const rate = exchangeRates[currency] || 1.0;
+    return priceEur * rate;
+}
+
+function getCurrencyLabel() {
+    return `${selectedCurrency}/MWh`;
+}
+
+async function fetchExchangeRates() {
+    try {
+        const response = await fetch('/api/exchange-rates');
+        if (!response.ok) return;
+        const data = await response.json();
+        if (data.rates) {
+            exchangeRates = data.rates;
+        }
+    } catch (err) {
+        console.error('Failed to fetch exchange rates:', err);
+    }
+}
+
+function initializeCurrencySelector() {
+    const currencySelector = document.getElementById('currencySelector');
+    if (!currencySelector) return;
+
+    currencySelector.value = selectedCurrency;
+
+    currencySelector.addEventListener('change', (e) => {
+        selectedCurrency = e.target.value;
+        // Re-render all price-related displays
+        if (currentData && Object.keys(currentData).length > 0) {
+            renderCurrentValues(currentData);
+        }
+        loadCorrelationData();
+        loadTodayPrices();
+    });
+}
+
+// =============================================================================
+// TODAY/TOMORROW PRICE CHART
+// =============================================================================
+
+function initializeTodayPriceChart() {
+    const ctx = document.getElementById('todayPriceChart');
+    if (!ctx) return;
+
+    todayPriceChart = new Chart(ctx.getContext('2d'), {
+        type: 'line',
+        data: { datasets: [] },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: { mode: 'index', intersect: false },
+            plugins: {
+                legend: {
+                    display: true,
+                    position: 'top',
+                    labels: { color: '#a0a0a0', padding: 15 }
+                },
+                datalabels: { display: false },
+                tooltip: {
+                    backgroundColor: 'rgba(30, 30, 30, 0.95)',
+                    titleColor: '#ffffff',
+                    bodyColor: '#a0a0a0',
+                    borderColor: '#333333',
+                    borderWidth: 1,
+                    padding: 12,
+                    displayColors: true,
+                    callbacks: {
+                        label: function(context) {
+                            return `${context.dataset.label}: ${context.parsed.y?.toFixed(2) || 0} ${getCurrencyLabel()}`;
+                        }
+                    }
+                }
+            },
+            scales: {
+                x: {
+                    type: 'time',
+                    time: {
+                        unit: 'hour',
+                        displayFormats: { hour: 'HH:mm' }
+                    },
+                    grid: { color: '#252525', drawBorder: false },
+                    ticks: { maxTicksLimit: 24 }
+                },
+                y: {
+                    beginAtZero: false,
+                    grid: { color: '#252525', drawBorder: false },
+                    ticks: {
+                        callback: function(value) {
+                            return value.toFixed(0) + ' ' + selectedCurrency;
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+async function loadTodayPrices() {
+    const country = selectedCountries[0] || 'SE';
+    const zone = selectedZone || '';
+
+    try {
+        const response = await fetch(`/api/prices/today/${country}?zone=${zone}`);
+        if (!response.ok) {
+            console.error('Failed to load today prices:', response.status);
+            return;
+        }
+        const data = await response.json();
+        updateTodayPriceChart(data);
+        updateCurrentSpotPriceTile(data);
+    } catch (err) {
+        console.error('Today prices load error:', err);
+    }
+}
+
+function updateTodayPriceChart(data) {
+    if (!todayPriceChart) return;
+
+    const datasets = [];
+
+    // Today's prices
+    if (data.today && data.today.length > 0) {
+        const todayPoints = [];
+        for (const d of data.today) {
+            const date = parseTimestamp(d.timestamp);
+            if (date) todayPoints.push({ x: date, y: convertPrice(d.price, selectedCurrency) });
+        }
+
+        datasets.push({
+            label: `Today (${data.today_date})`,
+            data: todayPoints,
+            borderColor: priceColor.border,
+            backgroundColor: priceColor.background,
+            borderWidth: 2,
+            tension: 0.3,
+            pointRadius: 3,
+            pointHoverRadius: 5,
+            fill: true
+        });
+    }
+
+    // Tomorrow's prices
+    if (data.tomorrow && data.tomorrow.length > 0) {
+        const tomorrowPoints = [];
+        for (const d of data.tomorrow) {
+            const date = parseTimestamp(d.timestamp);
+            if (date) tomorrowPoints.push({ x: date, y: convertPrice(d.price, selectedCurrency) });
+        }
+
+        datasets.push({
+            label: `Tomorrow (${data.tomorrow_date})`,
+            data: tomorrowPoints,
+            borderColor: tomorrowPriceColor.border,
+            backgroundColor: tomorrowPriceColor.background,
+            borderWidth: 2,
+            borderDash: [5, 5],
+            tension: 0.3,
+            pointRadius: 3,
+            pointHoverRadius: 5,
+            fill: true
+        });
+    }
+
+    todayPriceChart.data.datasets = datasets;
+    todayPriceChart.options.scales.y.ticks.callback = function(value) {
+        return value.toFixed(0) + ' ' + selectedCurrency;
+    };
+    todayPriceChart.options.plugins.tooltip.callbacks.label = function(context) {
+        return `${context.dataset.label}: ${context.parsed.y?.toFixed(2) || 0} ${getCurrencyLabel()}`;
+    };
+    todayPriceChart.update('none');
+
+    const subtitle = `${data.zone} | ${data.country_name} | ${getCurrencyLabel()}`;
+    const subtitleEl = document.getElementById('todayPriceChartSubtitle');
+    if (subtitleEl) {
+        subtitleEl.textContent = subtitle + (data.has_tomorrow ? '' : ' | Tomorrow not yet available');
+    }
+}
+
+function updateCurrentSpotPriceTile(data) {
+    const valueEl = document.getElementById('spotPriceValue');
+    const unitEl = document.getElementById('spotPriceUnit');
+    const zoneEl = document.getElementById('spotPriceZone');
+    const timeEl = document.getElementById('spotPriceTime');
+
+    if (data.current_price) {
+        const converted = convertPrice(data.current_price.price, selectedCurrency);
+        valueEl.textContent = converted.toFixed(2);
+        unitEl.textContent = getCurrencyLabel();
+        zoneEl.textContent = data.zone;
+
+        if (data.current_price.timestamp) {
+            const date = parseTimestamp(data.current_price.timestamp);
+            if (date) {
+                timeEl.textContent = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + ' UTC';
+            }
+        }
+    } else {
+        valueEl.textContent = '--';
+        unitEl.textContent = getCurrencyLabel();
+        zoneEl.textContent = data.zone || '--';
+        timeEl.textContent = 'No current price data';
     }
 }
 
@@ -448,6 +673,14 @@ function initializeSettingsModal() {
                             <option value="180">6 Months</option>
                         </select>
                     </div>
+                    <div class="form-group">
+                        <label for="defaultCurrency">Default Currency</label>
+                        <select id="defaultCurrency">
+                            <option value="SEK">SEK (Swedish Krona)</option>
+                            <option value="EUR">EUR (Euro)</option>
+                            <option value="DKK">DKK (Danish Krone)</option>
+                        </select>
+                    </div>
                 </div>
                 <div class="modal-footer">
                     <button class="btn btn-secondary modal-cancel">Cancel</button>
@@ -459,13 +692,15 @@ function initializeSettingsModal() {
 
         document.getElementById('defaultCountry').value = settings.defaultCountry;
         document.getElementById('defaultDays').value = settings.defaultDays;
+        document.getElementById('defaultCurrency').value = settings.defaultCurrency || 'SEK';
 
         modal.querySelector('.modal-close').addEventListener('click', () => modal.classList.remove('active'));
         modal.querySelector('.modal-cancel').addEventListener('click', () => modal.classList.remove('active'));
         modal.querySelector('.modal-save').addEventListener('click', () => {
             const newSettings = {
                 defaultCountry: document.getElementById('defaultCountry').value,
-                defaultDays: parseInt(document.getElementById('defaultDays').value)
+                defaultDays: parseInt(document.getElementById('defaultDays').value),
+                defaultCurrency: document.getElementById('defaultCurrency').value
             };
             saveSettings(newSettings);
             modal.classList.remove('active');
@@ -599,8 +834,9 @@ async function loadData() {
         updateTypesChartVisibility();
         updatePieCharts();
 
-        // Also load correlation data
+        // Also load correlation data and today prices
         loadCorrelationData();
+        loadTodayPrices();
 
     } catch (error) {
         console.error('loadData error:', error);
@@ -684,7 +920,7 @@ function updatePriceChart(priceData) {
     const pointData = [];
     for (const d of priceData.data) {
         const date = parseTimestamp(d.timestamp);
-        if (date) pointData.push({ x: date, y: d.price });
+        if (date) pointData.push({ x: date, y: convertPrice(d.price, selectedCurrency) });
     }
 
     const pointRadius = pointData.length < 10 ? 6 : pointData.length < 50 ? 3 : 1;
@@ -703,9 +939,15 @@ function updatePriceChart(priceData) {
 
     const timeUnit = selectedDays <= 7 ? 'hour' : 'day';
     priceChart.options.scales.x.time.unit = timeUnit;
+    priceChart.options.scales.y.ticks.callback = function(value) {
+        return value.toFixed(0) + ' ' + selectedCurrency;
+    };
+    priceChart.options.plugins.tooltip.callbacks.label = function(context) {
+        return `${context.dataset.label}: ${context.parsed.y?.toFixed(2) || 0} ${getCurrencyLabel()}`;
+    };
     priceChart.update('none');
 
-    const subtitle = `${priceData.zone || 'avg'} | ${priceData.country_name}`;
+    const subtitle = `${priceData.zone || 'avg'} | ${priceData.country_name} | ${getCurrencyLabel()}`;
     document.getElementById('priceChartSubtitle').textContent = subtitle;
 }
 
@@ -723,7 +965,7 @@ function updateCorrelationChart(corrData) {
         const date = parseTimestamp(d.timestamp);
         if (date) {
             energyPoints.push({ x: date, y: d.energy_value });
-            pricePoints.push({ x: date, y: d.price });
+            pricePoints.push({ x: date, y: convertPrice(d.price, selectedCurrency) });
         }
     }
 
@@ -743,7 +985,7 @@ function updateCorrelationChart(corrData) {
             yAxisID: 'y'
         },
         {
-            label: `Spot Price (EUR/MWh)`,
+            label: `Spot Price (${getCurrencyLabel()})`,
             data: pricePoints,
             borderColor: priceColor.border,
             backgroundColor: 'transparent',
@@ -757,6 +999,10 @@ function updateCorrelationChart(corrData) {
 
     const timeUnit = selectedDays <= 7 ? 'hour' : 'day';
     correlationChart.options.scales.x.time.unit = timeUnit;
+    correlationChart.options.scales.y1.title.text = getCurrencyLabel();
+    correlationChart.options.scales.y1.ticks.callback = function(v) {
+        return v.toFixed(0) + ' ' + selectedCurrency;
+    };
     correlationChart.update('none');
 
     const r = corrData.correlation?.r;
@@ -774,7 +1020,7 @@ function updateScatterChart(corrData) {
         return;
     }
 
-    const scatterPoints = corrData.data.map(d => ({ x: d.energy_value, y: d.price }));
+    const scatterPoints = corrData.data.map(d => ({ x: d.energy_value, y: convertPrice(d.price, selectedCurrency) }));
     const etLabel = typeLabels[corrData.energy_type] || corrData.energy_type;
     const etColor = typeColors[corrData.energy_type] || typeColors.wind;
 
@@ -811,6 +1057,10 @@ function updateScatterChart(corrData) {
 
     scatterChart.data.datasets = datasets;
     scatterChart.options.scales.x.title.text = `${etLabel} Production (GW)`;
+    scatterChart.options.scales.y.title.text = `Spot Price (${getCurrencyLabel()})`;
+    scatterChart.options.plugins.tooltip.callbacks.label = function(context) {
+        return `Energy: ${context.parsed.x?.toFixed(3)} GW | Price: ${context.parsed.y?.toFixed(2)} ${getCurrencyLabel()}`;
+    };
     scatterChart.update('none');
 
     // Update correlation badge
@@ -902,7 +1152,7 @@ function renderCurrentValues(data) {
         const priceHtml = countryData.price
             ? `<div class="value-item value-item-full">
                     <span class="value-label">Spot Price (${countryData.price.zone})</span>
-                    <span class="value-number price">${countryData.price.value?.toFixed(2) || '--'} ${countryData.price.currency || 'EUR'}/MWh</span>
+                    <span class="value-number price">${convertPrice(countryData.price.value, selectedCurrency)?.toFixed(2) || '--'} ${getCurrencyLabel()}</span>
                </div>`
             : '';
 
@@ -1048,4 +1298,4 @@ setInterval(() => {
     loadStats();
 }, 5 * 60 * 1000);
 
-console.log('Nordic Energy Dashboard v9 loaded (with Nordpool correlation)');
+console.log('Nordic Energy Dashboard v10 loaded (today/tomorrow prices, currency selection)');
