@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Nordic Energy Dashboard</title>
-    <link rel="stylesheet" href="/static/css/style.css?v=8">
+    <link rel="stylesheet" href="/static/css/style.css?v=9">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
@@ -224,12 +224,117 @@
                         <!-- Pie charts will be dynamically inserted here -->
                     </div>
                 </div>
+
+                <!-- ============================================================= -->
+                <!-- PRICE & CORRELATION ANALYSIS SECTION                          -->
+                <!-- ============================================================= -->
+                <div class="correlation-section">
+                    <h2 class="section-title">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <line x1="12" y1="1" x2="12" y2="23"></line>
+                            <path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path>
+                        </svg>
+                        Nordpool Spot Price &amp; Correlation Analysis
+                    </h2>
+
+                    <!-- Correlation Controls -->
+                    <div class="correlation-controls">
+                        <div class="control-group">
+                            <label class="control-label">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"></path>
+                                    <circle cx="12" cy="10" r="3"></circle>
+                                </svg>
+                                Bidding Zone
+                            </label>
+                            <select id="zoneSelector" class="control-select">
+                                <option value="">Loading...</option>
+                            </select>
+                        </div>
+                        <div class="control-group">
+                            <label class="control-label">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
+                                </svg>
+                                Energy Type
+                            </label>
+                            <select id="energyTypeSelector" class="control-select">
+                                <option value="wind">Wind</option>
+                                <option value="hydro">Hydro</option>
+                                <option value="nuclear">Nuclear</option>
+                                <option value="thermal">Thermal</option>
+                                <option value="not_specified">Other</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <!-- Correlation Summary Cards -->
+                    <div class="correlation-summary" id="correlationSummary">
+                        <!-- Cards injected by JS -->
+                    </div>
+
+                    <!-- Spot Price Chart -->
+                    <div class="chart-card">
+                        <div class="chart-header">
+                            <h2>
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <line x1="12" y1="1" x2="12" y2="23"></line>
+                                    <path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path>
+                                </svg>
+                                Spot Price
+                            </h2>
+                            <span class="chart-subtitle" id="priceChartSubtitle">EUR/MWh</span>
+                        </div>
+                        <div class="chart-container">
+                            <canvas id="priceChart"></canvas>
+                        </div>
+                    </div>
+
+                    <!-- Dual-Axis Correlation Chart -->
+                    <div class="chart-card">
+                        <div class="chart-header">
+                            <h2>
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
+                                </svg>
+                                Price vs Energy Production
+                            </h2>
+                            <span class="chart-subtitle" id="correlationChartSubtitle"></span>
+                        </div>
+                        <div class="chart-container">
+                            <canvas id="correlationChart"></canvas>
+                        </div>
+                    </div>
+
+                    <!-- Scatter Plot -->
+                    <div class="chart-card">
+                        <div class="chart-header">
+                            <h2>
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <circle cx="7.5" cy="7.5" r="2"></circle>
+                                    <circle cx="16.5" cy="16.5" r="2"></circle>
+                                    <circle cx="16.5" cy="7.5" r="2"></circle>
+                                    <circle cx="7.5" cy="16.5" r="2"></circle>
+                                    <rect x="2" y="2" width="20" height="20" rx="2"></rect>
+                                </svg>
+                                Scatter: Energy vs Price
+                            </h2>
+                            <div class="correlation-badge" id="correlationBadge">
+                                <span class="corr-label">r = </span>
+                                <span class="corr-value" id="corrValueDisplay">--</span>
+                            </div>
+                        </div>
+                        <div class="chart-container chart-container-scatter">
+                            <canvas id="scatterChart"></canvas>
+                        </div>
+                    </div>
+                </div>
             </section>
         </main>
 
         <!-- Footer -->
         <footer class="footer">
-            <p>Data source: <a href="https://driftsdata.statnett.no" target="_blank">Statnett</a> | Nordic Power Grid Real-time Data</p>
+            <p>Data sources: <a href="https://driftsdata.statnett.no" target="_blank">Statnett</a> (energy) | <a href="https://www.nordpoolgroup.com" target="_blank">Nordpool</a> (spot prices) | Nordic Power Grid Real-time Data</p>
         </footer>
     </div>
 
@@ -239,6 +344,6 @@
         <p>Loading data...</p>
     </div>
 
-    <script src="/static/js/app.js?v=8"></script>
+    <script src="/static/js/app.js?v=9"></script>
 </body>
 </html>
