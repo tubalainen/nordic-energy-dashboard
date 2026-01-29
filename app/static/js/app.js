@@ -273,10 +273,10 @@ function initializeCorrelationCharts() {
     const priceCtx = document.getElementById('priceChart').getContext('2d');
     const priceOpts = JSON.parse(JSON.stringify(lineChartOptions));
     priceOpts.plugins.tooltip.callbacks.label = function(context) {
-        return `${context.dataset.label}: ${context.parsed.y?.toFixed(2) || 0} EUR/MWh`;
+        return `${context.dataset.label}: ${context.parsed.y?.toFixed(2) || 0} ${getCurrencyLabel()}`;
     };
     priceOpts.scales.y.ticks.callback = function(value) {
-        return value.toFixed(0) + ' EUR';
+        return value.toFixed(0) + ' ' + selectedCurrency;
     };
     priceChart = new Chart(priceCtx, {
         type: 'line',
@@ -321,8 +321,8 @@ function initializeCorrelationCharts() {
                     type: 'linear',
                     position: 'right',
                     grid: { drawOnChartArea: false },
-                    title: { display: true, text: 'EUR/MWh', color: '#a0a0a0' },
-                    ticks: { callback: v => v.toFixed(0) + ' EUR' }
+                    title: { display: true, text: getCurrencyLabel(), color: '#a0a0a0' },
+                    ticks: { callback: v => v.toFixed(0) + ' ' + selectedCurrency }
                 }
             }
         }
@@ -345,7 +345,7 @@ function initializeCorrelationCharts() {
                     borderColor: '#333333', borderWidth: 1, padding: 12,
                     callbacks: {
                         label: function(context) {
-                            return `Energy: ${context.parsed.x?.toFixed(3)} GW | Price: ${context.parsed.y?.toFixed(2)} EUR/MWh`;
+                            return `Energy: ${context.parsed.x?.toFixed(3)} GW | Price: ${context.parsed.y?.toFixed(2)} ${getCurrencyLabel()}`;
                         }
                     }
                 }
@@ -358,7 +358,7 @@ function initializeCorrelationCharts() {
                 },
                 y: {
                     type: 'linear',
-                    title: { display: true, text: 'Spot Price (EUR/MWh)', color: '#a0a0a0' },
+                    title: { display: true, text: `Spot Price (${getCurrencyLabel()})`, color: '#a0a0a0' },
                     grid: { color: '#252525', drawBorder: false }
                 }
             }
@@ -416,13 +416,13 @@ async function updateZoneSelector() {
 // =============================================================================
 
 function convertPrice(priceEur, currency) {
-    if (!currency || currency === 'EUR') return priceEur;
-    const rate = exchangeRates[currency] || 1.0;
-    return priceEur * rate;
+    // Prices from API are EUR/MWh; convert to selected currency per kWh
+    const rate = (!currency || currency === 'EUR') ? 1.0 : (exchangeRates[currency] || 1.0);
+    return priceEur * rate / 1000;
 }
 
 function getCurrencyLabel() {
-    return `${selectedCurrency}/MWh`;
+    return `${selectedCurrency}/kWh`;
 }
 
 async function fetchExchangeRates() {
