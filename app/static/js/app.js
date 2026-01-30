@@ -54,7 +54,7 @@ let countryZones = {};
 
 // Currency & exchange rate state
 let selectedCurrency = settings.defaultCurrency || 'SEK';
-let exchangeRates = { EUR: 1.0, SEK: 11.0, DKK: 7.45 };
+let exchangeRates = { EUR: 1.0, SEK: 11.0, DKK: 7.45, NOK: 11.5 };
 
 // =============================================================================
 // COLOR SCHEMES
@@ -273,10 +273,10 @@ function initializeCorrelationCharts() {
     const priceCtx = document.getElementById('priceChart').getContext('2d');
     const priceOpts = JSON.parse(JSON.stringify(lineChartOptions));
     priceOpts.plugins.tooltip.callbacks.label = function(context) {
-        return `${context.dataset.label}: ${context.parsed.y?.toFixed(2) || 0} EUR/MWh`;
+        return `${context.dataset.label}: ${context.parsed.y?.toFixed(4) || 0} EUR/kWh`;
     };
     priceOpts.scales.y.ticks.callback = function(value) {
-        return value.toFixed(0) + ' EUR';
+        return value.toFixed(2) + ' EUR';
     };
     priceChart = new Chart(priceCtx, {
         type: 'line',
@@ -321,8 +321,8 @@ function initializeCorrelationCharts() {
                     type: 'linear',
                     position: 'right',
                     grid: { drawOnChartArea: false },
-                    title: { display: true, text: 'EUR/MWh', color: '#a0a0a0' },
-                    ticks: { callback: v => v.toFixed(0) + ' EUR' }
+                    title: { display: true, text: 'EUR/kWh', color: '#a0a0a0' },
+                    ticks: { callback: v => v.toFixed(4) + ' EUR' }
                 }
             }
         }
@@ -345,7 +345,7 @@ function initializeCorrelationCharts() {
                     borderColor: '#333333', borderWidth: 1, padding: 12,
                     callbacks: {
                         label: function(context) {
-                            return `Energy: ${context.parsed.x?.toFixed(3)} GW | Price: ${context.parsed.y?.toFixed(2)} EUR/MWh`;
+                            return `Energy: ${context.parsed.x?.toFixed(3)} GW | Price: ${context.parsed.y?.toFixed(4)} EUR/kWh`;
                         }
                     }
                 }
@@ -358,7 +358,7 @@ function initializeCorrelationCharts() {
                 },
                 y: {
                     type: 'linear',
-                    title: { display: true, text: 'Spot Price (EUR/MWh)', color: '#a0a0a0' },
+                    title: { display: true, text: 'Spot Price (EUR/kWh)', color: '#a0a0a0' },
                     grid: { color: '#252525', drawBorder: false }
                 }
             }
@@ -422,7 +422,7 @@ function convertPrice(priceEur, currency) {
 }
 
 function getCurrencyLabel() {
-    return `${selectedCurrency}/MWh`;
+    return `${selectedCurrency}/kWh`;
 }
 
 async function fetchExchangeRates() {
@@ -507,7 +507,7 @@ function initializeTodayPriceChart() {
                     grid: { color: '#252525', drawBorder: false },
                     ticks: {
                         callback: function(value) {
-                            return value.toFixed(0) + ' ' + selectedCurrency;
+                            return value.toFixed(2) + ' ' + selectedCurrency;
                         }
                     }
                 }
@@ -584,7 +584,7 @@ function updateTodayPriceChart(data) {
 
     todayPriceChart.data.datasets = datasets;
     todayPriceChart.options.scales.y.ticks.callback = function(value) {
-        return value.toFixed(0) + ' ' + selectedCurrency;
+        return value.toFixed(2) + ' ' + selectedCurrency;
     };
     todayPriceChart.options.plugins.tooltip.callbacks.label = function(context) {
         return `${context.dataset.label}: ${context.parsed.y?.toFixed(2) || 0} ${getCurrencyLabel()}`;
@@ -679,6 +679,7 @@ function initializeSettingsModal() {
                             <option value="SEK">SEK (Swedish Krona)</option>
                             <option value="EUR">EUR (Euro)</option>
                             <option value="DKK">DKK (Danish Krone)</option>
+                            <option value="NOK">NOK (Norwegian Krone)</option>
                         </select>
                     </div>
                 </div>
@@ -940,7 +941,7 @@ function updatePriceChart(priceData) {
     const timeUnit = selectedDays <= 7 ? 'hour' : 'day';
     priceChart.options.scales.x.time.unit = timeUnit;
     priceChart.options.scales.y.ticks.callback = function(value) {
-        return value.toFixed(0) + ' ' + selectedCurrency;
+        return value.toFixed(2) + ' ' + selectedCurrency;
     };
     priceChart.options.plugins.tooltip.callbacks.label = function(context) {
         return `${context.dataset.label}: ${context.parsed.y?.toFixed(2) || 0} ${getCurrencyLabel()}`;
@@ -1001,7 +1002,7 @@ function updateCorrelationChart(corrData) {
     correlationChart.options.scales.x.time.unit = timeUnit;
     correlationChart.options.scales.y1.title.text = getCurrencyLabel();
     correlationChart.options.scales.y1.ticks.callback = function(v) {
-        return v.toFixed(0) + ' ' + selectedCurrency;
+        return v.toFixed(2) + ' ' + selectedCurrency;
     };
     correlationChart.update('none');
 
