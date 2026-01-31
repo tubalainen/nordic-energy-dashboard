@@ -415,6 +415,25 @@ def init_db():
         target_version = SCHEMA_TARGET_VERSION
 
         if current_version == target_version:
+            # Ensure schema_version table exists even if database was created
+            # before versioning was introduced.
+            cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'"
+            )
+            if cursor.fetchone() is None:
+                logger.info(
+                    f"Pre-versioning database detected at version {current_version}, "
+                    "recording baseline"
+                )
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS schema_version (
+                        version INTEGER NOT NULL,
+                        applied_at DATETIME NOT NULL
+                    )
+                ''')
+                for v in range(1, current_version + 1):
+                    _set_schema_version(cursor, v)
+                conn.commit()
             logger.info(f"Database schema up to date (version {current_version})")
             return
 
