@@ -295,62 +295,185 @@ def get_db():
         conn.close()
 
 
+SCHEMA_TARGET_VERSION = 2
+
+
+def _migrate_v1(cursor):
+    """Migration v1: Create baseline tables (energy_status, energy_types) and indices."""
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS energy_status (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp DATETIME NOT NULL,
+            country TEXT NOT NULL CHECK(country IN ('SE', 'NO', 'FI', 'DK')),
+            production REAL,
+            consumption REAL,
+            import_value REAL,
+            export_value REAL,
+            UNIQUE(timestamp, country)
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS energy_types (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp DATETIME NOT NULL,
+            country TEXT NOT NULL CHECK(country IN ('SE', 'NO', 'FI', 'DK')),
+            nuclear REAL,
+            hydro REAL,
+            wind REAL,
+            thermal REAL,
+            not_specified REAL,
+            UNIQUE(timestamp, country)
+        )
+    ''')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_status_ts ON energy_status(timestamp)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_status_country ON energy_status(country)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_types_ts ON energy_types(timestamp)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_types_country ON energy_types(country)')
+
+
+def _migrate_v2(cursor):
+    """Migration v2: Add spot_prices table and indices."""
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS spot_prices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp DATETIME NOT NULL,
+            country TEXT NOT NULL CHECK(country IN ('SE', 'NO', 'FI', 'DK')),
+            zone TEXT NOT NULL,
+            price REAL NOT NULL,
+            currency TEXT DEFAULT 'EUR',
+            UNIQUE(timestamp, zone)
+        )
+    ''')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_prices_ts ON spot_prices(timestamp)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_prices_zone ON spot_prices(zone)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_prices_country ON spot_prices(country)')
+
+
+# Ordered list of migrations.  Key = target version, value = callable.
+MIGRATIONS = {
+    1: _migrate_v1,
+    2: _migrate_v2,
+}
+
+
+def _get_schema_version(cursor):
+    """Return the current schema version, or 0 if the database is fresh."""
+    # Check if the schema_version table exists
+    cursor.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'"
+    )
+    if cursor.fetchone() is None:
+        # No version table — check if this is a pre-versioning database
+        cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='energy_status'"
+        )
+        has_energy_status = cursor.fetchone() is not None
+
+        cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='spot_prices'"
+        )
+        has_spot_prices = cursor.fetchone() is not None
+
+        if has_energy_status and has_spot_prices:
+            # Database has all current tables but no version tracking (created
+            # before versioning was added).  Treat as version 2.
+            return 2
+        elif has_energy_status:
+            # Original schema from the first commit — version 1.
+            return 1
+        else:
+            # Completely fresh database.
+            return 0
+
+    cursor.execute('SELECT MAX(version) as current_version FROM schema_version')
+    row = cursor.fetchone()
+    return row['current_version'] if row and row['current_version'] is not None else 0
+
+
+def _set_schema_version(cursor, version):
+    """Record that a migration has been applied."""
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS schema_version (
+            version INTEGER NOT NULL,
+            applied_at DATETIME NOT NULL
+        )
+    ''')
+    cursor.execute(
+        'INSERT INTO schema_version (version, applied_at) VALUES (?, ?)',
+        (version, datetime.utcnow())
+    )
+
+
 def init_db():
-    """Initialize the database"""
+    """Initialize the database with schema version checking and migrations."""
     os.makedirs(os.path.dirname(DATABASE_PATH), exist_ok=True)
 
     with get_db() as conn:
         cursor = conn.cursor()
 
+        current_version = _get_schema_version(cursor)
+        target_version = SCHEMA_TARGET_VERSION
+
+        if current_version == target_version:
+            logger.info(f"Database schema up to date (version {current_version})")
+            return
+
+        if current_version > target_version:
+            logger.error(
+                f"Database schema version ({current_version}) is newer than "
+                f"application target ({target_version}). "
+                "Refusing to downgrade — please update the application."
+            )
+            raise RuntimeError(
+                f"Database schema version {current_version} is newer than "
+                f"application version {target_version}"
+            )
+
+        logger.info(
+            f"Database schema check: current version {current_version}, "
+            f"target version {target_version}"
+        )
+
+        # Ensure schema_version table exists before recording migrations
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS energy_status (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp DATETIME NOT NULL,
-                country TEXT NOT NULL CHECK(country IN ('SE', 'NO', 'FI', 'DK')),
-                production REAL,
-                consumption REAL,
-                import_value REAL,
-                export_value REAL,
-                UNIQUE(timestamp, country)
+            CREATE TABLE IF NOT EXISTS schema_version (
+                version INTEGER NOT NULL,
+                applied_at DATETIME NOT NULL
             )
         ''')
 
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS energy_types (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp DATETIME NOT NULL,
-                country TEXT NOT NULL CHECK(country IN ('SE', 'NO', 'FI', 'DK')),
-                nuclear REAL,
-                hydro REAL,
-                wind REAL,
-                thermal REAL,
-                not_specified REAL,
-                UNIQUE(timestamp, country)
-            )
-        ''')
+        # If this is a pre-versioning database, record its detected version
+        # so migration history is complete.
+        if current_version > 0:
+            cursor.execute('SELECT COUNT(*) as cnt FROM schema_version')
+            if cursor.fetchone()['cnt'] == 0:
+                logger.info(
+                    f"Pre-versioning database detected at version {current_version}, "
+                    "recording baseline"
+                )
+                for v in range(1, current_version + 1):
+                    _set_schema_version(cursor, v)
 
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS spot_prices (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp DATETIME NOT NULL,
-                country TEXT NOT NULL CHECK(country IN ('SE', 'NO', 'FI', 'DK')),
-                zone TEXT NOT NULL,
-                price REAL NOT NULL,
-                currency TEXT DEFAULT 'EUR',
-                UNIQUE(timestamp, zone)
-            )
-        ''')
+        # Apply pending migrations in order
+        for version in range(current_version + 1, target_version + 1):
+            migration_fn = MIGRATIONS.get(version)
+            if migration_fn is None:
+                logger.error(f"No migration function defined for version {version}")
+                raise RuntimeError(f"Missing migration for version {version}")
 
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_status_ts ON energy_status(timestamp)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_status_country ON energy_status(country)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_types_ts ON energy_types(timestamp)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_types_country ON energy_types(country)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_prices_ts ON spot_prices(timestamp)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_prices_zone ON spot_prices(zone)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_prices_country ON spot_prices(country)')
+            logger.info(
+                f"Applying migration v{version - 1} -> v{version}: "
+                f"{migration_fn.__doc__.strip() if migration_fn.__doc__ else 'no description'}"
+            )
+            migration_fn(cursor)
+            _set_schema_version(cursor, version)
+            logger.info(f"Migration v{version - 1} -> v{version} applied successfully")
 
         conn.commit()
-        logger.info("Database initialized")
+        logger.info(
+            f"Database schema updated to version {target_version} "
+            f"(was version {current_version})"
+        )
 
 
 # =============================================================================
