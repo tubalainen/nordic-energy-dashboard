@@ -126,9 +126,10 @@ last_exchange_rate_fetch_status = None
 exchange_rates = {
     'EUR': 1.0,
     'SEK': 11.0,   # Fallback defaults
-    'DKK': 7.45
+    'DKK': 7.45,
+    'NOK': 11.5
 }
-VALID_CURRENCIES = frozenset(['EUR', 'SEK', 'DKK'])
+VALID_CURRENCIES = frozenset(['EUR', 'SEK', 'DKK', 'NOK'])
 
 # =============================================================================
 # SECURITY MIDDLEWARE
@@ -584,14 +585,14 @@ def cleanup_old_data():
 # =============================================================================
 
 def fetch_exchange_rates():
-    """Fetch EUR->SEK and EUR->DKK exchange rates from Frankfurter API (ECB data)"""
+    """Fetch EUR->SEK, EUR->DKK, EUR->NOK exchange rates from Frankfurter API (ECB data)"""
     global exchange_rates, last_exchange_rate_fetch_time, last_exchange_rate_fetch_status
 
     logger.info("Fetching exchange rates...")
 
     try:
         response = requests.get(
-            'https://api.frankfurter.app/latest?from=EUR&to=SEK,DKK',
+            'https://api.frankfurter.app/latest?from=EUR&to=SEK,DKK,NOK',
             timeout=15
         )
         response.raise_for_status()
@@ -602,11 +603,13 @@ def fetch_exchange_rates():
             exchange_rates['SEK'] = float(rates['SEK'])
         if 'DKK' in rates:
             exchange_rates['DKK'] = float(rates['DKK'])
+        if 'NOK' in rates:
+            exchange_rates['NOK'] = float(rates['NOK'])
         exchange_rates['EUR'] = 1.0
 
         last_exchange_rate_fetch_time = datetime.utcnow()
         last_exchange_rate_fetch_status = "success"
-        logger.info(f"Exchange rates updated: EUR->SEK={exchange_rates['SEK']}, EUR->DKK={exchange_rates['DKK']}")
+        logger.info(f"Exchange rates updated: EUR->SEK={exchange_rates['SEK']}, EUR->DKK={exchange_rates['DKK']}, EUR->NOK={exchange_rates['NOK']}")
 
     except Exception as e:
         last_exchange_rate_fetch_time = datetime.utcnow()
@@ -775,9 +778,10 @@ def get_prices(country):
         ts = row['timestamp']
         if ts and 'T' not in ts:
             ts = ts.replace(' ', 'T')
+        price_mwh = row['price'] or 0
         data.append({
             'timestamp': ts,
-            'price': row['price'] or 0,
+            'price': price_mwh / 1000.0,
             'currency': row['currency'] or 'EUR',
             'zone': row['zone']
         })
@@ -834,9 +838,10 @@ def get_today_prices(country):
             ts = row['timestamp']
             if ts and 'T' not in ts:
                 ts = ts.replace(' ', 'T')
+            price_mwh = row['price'] or 0
             result.append({
                 'timestamp': ts,
-                'price': row['price'] or 0,
+                'price': price_mwh / 1000.0,
                 'currency': row['currency'] or 'EUR',
                 'zone': row['zone']
             })
@@ -850,8 +855,9 @@ def get_today_prices(country):
         ts_str = row['timestamp']
         ts = datetime.strptime(ts_str.replace('T', ' ').split('.')[0], '%Y-%m-%d %H:%M:%S') if ts_str else None
         if ts and ts <= now:
+            price_mwh = row['price'] or 0
             current_price = {
-                'price': row['price'],
+                'price': price_mwh / 1000.0,
                 'currency': row['currency'] or 'EUR',
                 'timestamp': ts_str.replace(' ', 'T') if ts_str and 'T' not in ts_str else ts_str
             }
@@ -945,12 +951,13 @@ def get_correlation(country):
                 display_ts = ts
                 if display_ts and 'T' not in display_ts:
                     display_ts = display_ts.replace(' ', 'T')
+                price_kwh = price_val / 1000.0
                 paired.append({
                     'timestamp': display_ts,
-                    'price': price_val,
+                    'price': price_kwh,
                     'energy_value': energy_val
                 })
-                prices_list.append(price_val)
+                prices_list.append(price_kwh)
                 energy_list.append(energy_val)
 
     r = pearson_correlation(energy_list, prices_list)
@@ -998,13 +1005,13 @@ def get_correlation_summary(country):
         ''', (zone, start_date))
         price_rows = cursor.fetchall()
 
-        # Build price lookup by hour
+        # Build price lookup by hour (convert MWh to kWh)
         price_by_hour = {}
         for row in price_rows:
             ts = row['timestamp']
             hour_key = ts[:13] + ':00:00' if ts else None
             if hour_key:
-                price_by_hour[hour_key] = row['price']
+                price_by_hour[hour_key] = (row['price'] or 0) / 1000.0
 
         # Get energy types aggregated to hourly
         cursor.execute('''
@@ -1106,8 +1113,9 @@ def get_current():
                     }
                 }
                 if price_row:
+                    price_mwh = price_row['price'] or 0
                     entry['price'] = {
-                        'value': price_row['price'],
+                        'value': price_mwh / 1000.0,
                         'currency': price_row['currency'],
                         'zone': price_row['zone'],
                         'timestamp': price_row['timestamp']
