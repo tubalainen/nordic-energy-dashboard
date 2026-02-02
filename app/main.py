@@ -5,6 +5,8 @@ Security-hardened version for production deployment
 Includes Nordpool spot price correlation analysis
 """
 
+__version__ = "1.5"
+
 import os
 import sys
 import sqlite3
