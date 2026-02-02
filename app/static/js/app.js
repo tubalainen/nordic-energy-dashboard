@@ -523,7 +523,10 @@ async function loadTodayPrices() {
     try {
         const response = await fetch(`/api/prices/today/${country}?zone=${zone}`);
         if (!response.ok) {
-            console.error('Failed to load today prices:', response.status);
+            console.error('Failed to load today prices:', response.status, response.statusText);
+            // Update with empty data to show "no data" message
+            updateTodayPriceChart({ today: [], tomorrow: [], zone: zone });
+            updateCurrentSpotPriceTile({ zone: zone });
             return;
         }
         const data = await response.json();
@@ -531,6 +534,9 @@ async function loadTodayPrices() {
         updateCurrentSpotPriceTile(data);
     } catch (err) {
         console.error('Today prices load error:', err);
+        // Update with empty data to show "no data" message
+        updateTodayPriceChart({ today: [], tomorrow: [], zone: zone });
+        updateCurrentSpotPriceTile({ zone: zone });
     }
 }
 
@@ -883,6 +889,7 @@ async function loadCorrelationData() {
             const priceData = await priceRes.json();
             updatePriceChart(priceData);
         } else {
+            console.error('Failed to load price data:', priceRes.status, priceRes.statusText);
             priceChart.data.datasets = [];
             priceChart.update('none');
         }
@@ -893,6 +900,7 @@ async function loadCorrelationData() {
             updateCorrelationChart(corrData);
             updateScatterChart(corrData);
         } else {
+            console.error('Failed to load correlation data:', corrRes.status, corrRes.statusText);
             correlationChart.data.datasets = [];
             correlationChart.update('none');
             scatterChart.data.datasets = [];
@@ -903,10 +911,14 @@ async function loadCorrelationData() {
         if (summaryRes.ok) {
             const summaryData = await summaryRes.json();
             renderCorrelationSummary(summaryData);
+        } else {
+            console.error('Failed to load correlation summary:', summaryRes.status, summaryRes.statusText);
+            renderCorrelationSummary(null);
         }
 
     } catch (err) {
         console.error('Correlation data load error:', err);
+        renderCorrelationSummary(null);
     }
 }
 
