@@ -588,6 +588,7 @@ def _fetch_nordpool_day(target_date, zones):
     }
 
     last_err = None
+    data = None
     for attempt in range(NORDPOOL_API_RETRIES):
         try:
             resp = requests.get(
@@ -597,6 +598,7 @@ def _fetch_nordpool_day(target_date, zones):
             )
             resp.raise_for_status()
             data = resp.json()
+            logger.info(f"Nordpool API successful for {target_date}, got response with keys: {list(data.keys()) if isinstance(data, dict) else 'non-dict response'}")
             break
         except Exception as e:
             last_err = e
@@ -609,12 +611,25 @@ def _fetch_nordpool_day(target_date, zones):
         logger.error(f"Nordpool API failed after {NORDPOOL_API_RETRIES} attempts: {last_err}")
         return []
 
+    if not data:
+        logger.error("Nordpool API returned empty response")
+        return []
+
     results = []
     # multiAreaEntries contains 15-min intervals; aggregate to hourly by
     # keeping the first 15-min price of each hour (prices are constant within
     # an hour for day-ahead auction).
+    multi_area_entries = data.get('multiAreaEntries', [])
+
+    if not multi_area_entries:
+        logger.warning(f"No multiAreaEntries in Nordpool response for {target_date}. Response keys: {list(data.keys())}")
+        # Log a sample of the response for debugging (first 500 chars)
+        import json
+        response_sample = json.dumps(data, default=str)[:500]
+        logger.warning(f"Response sample: {response_sample}")
+
     seen_hours = {}  # (zone, hour_start) -> True
-    for entry in data.get('multiAreaEntries', []):
+    for entry in multi_area_entries:
         delivery_start = entry.get('deliveryStart')
         if not delivery_start:
             continue
@@ -641,6 +656,7 @@ def _fetch_nordpool_day(target_date, zones):
             naive_utc = hour_start.replace(tzinfo=None)
             results.append((naive_utc, zone, price_val))
 
+    logger.info(f"Extracted {len(results)} price records for {target_date}")
     return results
 
 
@@ -655,13 +671,21 @@ def fetch_and_store_prices():
         today = datetime.utcnow().date()
         tomorrow = today + timedelta(days=1)
 
+        logger.info(f"Fetching prices for zones: {all_zones}")
+        logger.info(f"Fetching prices for dates: {today}, {tomorrow}")
+
         all_results = []
         for target_date in [today, tomorrow]:
             day_results = _fetch_nordpool_day(target_date, all_zones)
             all_results.extend(day_results)
+            logger.info(f"Fetched {len(day_results)} records for {target_date}")
 
         if not all_results:
-            logger.warning("No price data returned from Nordpool")
+            logger.error("CRITICAL: No price data returned from Nordpool API for any zone or date")
+            logger.error(f"This means the correlation summary and current spot price will not display data")
+            logger.error(f"Attempted to fetch for zones: {all_zones}")
+            logger.error(f"Attempted to fetch for dates: {today}, {tomorrow}")
+            logger.error(f"API URL: {NORDPOOL_API_URL}")
             last_price_fetch_status = "no_data"
             last_price_fetch_time = datetime.utcnow()
             return
@@ -673,6 +697,7 @@ def fetch_and_store_prices():
             for timestamp, zone_code, price in all_results:
                 country = ZONE_TO_COUNTRY.get(zone_code)
                 if not country:
+                    logger.warning(f"Unknown zone: {zone_code}, skipping")
                     continue
 
                 cursor.execute('''
@@ -685,12 +710,14 @@ def fetch_and_store_prices():
             conn.commit()
             last_price_fetch_time = datetime.utcnow()
             last_price_fetch_status = "success"
-            logger.info(f"Stored {stored} price records")
+            logger.info(f"Successfully stored {stored} price records to database")
 
     except Exception as e:
         last_price_fetch_time = datetime.utcnow()
         last_price_fetch_status = "error"
-        logger.error(f"Price fetch failed: {e}")
+        logger.error(f"Price fetch failed with exception: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
 
 
 def cleanup_old_data():
