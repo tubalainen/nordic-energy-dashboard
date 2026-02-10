@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Nordic Energy Dashboard</title>
-    <link rel="stylesheet" href="/static/css/style.css?v=10">
+    <link rel="stylesheet" href="/static/css/style.css?v=11">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
@@ -281,6 +281,22 @@
                                 <option value="NOK">NOK</option>
                             </select>
                         </div>
+                        <div class="control-group" id="taxToggleGroup" style="display: none;">
+                            <label class="control-label">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <rect x="2" y="7" width="20" height="14" rx="2" ry="2"/>
+                                    <path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/>
+                                </svg>
+                                Swedish Taxes &amp; Fees
+                            </label>
+                            <div class="toggle-switch-container">
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="taxToggle">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                                <span class="toggle-label" id="taxToggleLabel">Off</span>
+                            </div>
+                        </div>
                     </div>
 
                     <!-- Current Spot Price Tile -->
@@ -393,6 +409,6 @@
         <p>Loading data...</p>
     </div>
 
-    <script src="/static/js/app.js?v=10"></script>
+    <script src="/static/js/app.js?v=11"></script>
 </body>
 </html>
