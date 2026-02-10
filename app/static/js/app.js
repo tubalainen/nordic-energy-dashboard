@@ -1,6 +1,6 @@
 /**
  * Nordic Energy Dashboard - Frontend Application
- * Version 11 - Anomaly filtering, Swedish tax toggle
+ * Version 10 - Today/tomorrow prices, currency selection, current spot price tile
  */
 
 // =============================================================================
@@ -54,12 +54,6 @@ let selectedEnergyType = 'wind';
 // Currency & exchange rate state
 let selectedCurrency = settings.defaultCurrency || 'SEK';
 let exchangeRates = { EUR: 1.0, SEK: 11.0, DKK: 7.45, NOK: 11.5 };
-
-// Swedish tax toggle state
-let swedishTaxEnabled = false;
-const SWEDISH_ZONES = ['SE1', 'SE2', 'SE3', 'SE4'];
-const SWEDISH_TAX_VAT_MULTIPLIER = 1.25;  // 25% VAT
-const SWEDISH_TAX_FEE_EUR = 0.001;        // 0.1 EUR cent/kWh = 0.001 EUR/kWh
 
 // =============================================================================
 // COLOR SCHEMES
@@ -414,7 +408,6 @@ function initializeCorrelationControls() {
 
     zoneSelector.addEventListener('change', (e) => {
         selectedZone = e.target.value;
-        updateSwedishTaxToggleVisibility();
         loadCorrelationData();
         loadTodayPrices();
     });
@@ -424,43 +417,8 @@ function initializeCorrelationControls() {
         loadCorrelationData();
     });
 
-    // Initialize Swedish tax toggle
-    initializeSwedishTaxToggle();
-
     // Load zones for the first selected country
     updateZoneSelector();
-}
-
-function initializeSwedishTaxToggle() {
-    const toggle = document.getElementById('swedishTaxToggle');
-    if (!toggle) return;
-
-    toggle.addEventListener('change', (e) => {
-        swedishTaxEnabled = e.target.checked;
-        const label = document.getElementById('swedishTaxLabel');
-        if (label) label.textContent = swedishTaxEnabled ? 'On' : 'Off';
-        // Re-render all price displays
-        if (currentData && Object.keys(currentData).length > 0) {
-            renderCurrentValues(currentData);
-        }
-        loadCorrelationData();
-        loadTodayPrices();
-    });
-}
-
-function updateSwedishTaxToggleVisibility() {
-    const toggleGroup = document.getElementById('swedishTaxGroup');
-    if (!toggleGroup) return;
-
-    const isSwedishZone = SWEDISH_ZONES.includes(selectedZone);
-    toggleGroup.style.display = isSwedishZone ? 'flex' : 'none';
-
-    // Auto-disable if switching away from Swedish zone
-    if (!isSwedishZone && swedishTaxEnabled) {
-        swedishTaxEnabled = false;
-        const toggle = document.getElementById('swedishTaxToggle');
-        if (toggle) toggle.checked = false;
-    }
 }
 
 async function updateZoneSelector() {
@@ -483,7 +441,6 @@ async function updateZoneSelector() {
         }
 
         selectedZone = zoneSelector.value;
-        updateSwedishTaxToggleVisibility();
     } catch (err) {
         console.error('Failed to load zones:', err);
     }
@@ -494,22 +451,13 @@ async function updateZoneSelector() {
 // =============================================================================
 
 function convertPrice(priceEur, currency) {
-    let price = priceEur;
-    // Apply Swedish taxes & fees if enabled and a Swedish zone is selected
-    if (swedishTaxEnabled && SWEDISH_ZONES.includes(selectedZone)) {
-        price = (price * SWEDISH_TAX_VAT_MULTIPLIER) + SWEDISH_TAX_FEE_EUR;
-    }
-    if (!currency || currency === 'EUR') return price;
+    if (!currency || currency === 'EUR') return priceEur;
     const rate = exchangeRates[currency] || 1.0;
-    return price * rate;
+    return priceEur * rate;
 }
 
 function getCurrencyLabel() {
-    const base = `${selectedCurrency}/kWh`;
-    if (swedishTaxEnabled && SWEDISH_ZONES.includes(selectedZone)) {
-        return base + ' (incl. tax)';
-    }
-    return base;
+    return `${selectedCurrency}/kWh`;
 }
 
 async function fetchExchangeRates() {
@@ -1388,4 +1336,4 @@ setInterval(() => {
     loadStats();
 }, 5 * 60 * 1000);
 
-console.log('Nordic Energy Dashboard v11 loaded (anomaly filtering, Swedish tax toggle)');
+console.log('Nordic Energy Dashboard v10 loaded (today/tomorrow prices, currency selection)');
