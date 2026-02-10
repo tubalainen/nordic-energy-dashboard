@@ -5,7 +5,7 @@ Security-hardened version for production deployment
 Includes Nordpool spot price correlation analysis
 """
 
-__version__ = "1.9"
+__version__ = "1.8"
 
 import os
 import sys
@@ -37,14 +37,6 @@ LOG_LEVEL = os.environ.get('LOG_LEVEL', 'WARNING').upper()
 ENABLE_DEBUG_ENDPOINTS = os.environ.get('ENABLE_DEBUG_ENDPOINTS', 'false').lower() == 'true'
 RATE_LIMIT_DEFAULT = os.environ.get('RATE_LIMIT_DEFAULT', '100 per minute')
 RATE_LIMIT_API = os.environ.get('RATE_LIMIT_API', '30 per minute')
-
-# Spike detection settings
-# Reject values that drop below this fraction of the recent median (0.20 = 20%)
-SPIKE_THRESHOLD = float(os.environ.get('SPIKE_THRESHOLD', '0.20'))
-# Minimum median (GW) before spike detection kicks in (avoids filtering genuinely low values)
-SPIKE_MIN_MEDIAN_GW = float(os.environ.get('SPIKE_MIN_MEDIAN_GW', '1.0'))
-# Number of recent data points to use for median calculation
-SPIKE_LOOKBACK = int(os.environ.get('SPIKE_LOOKBACK', '12'))
 
 # API URLs
 URL_CONSUMPTION = "https://driftsdata.statnett.no/restapi/ProductionConsumption/GetLatestDetailedOverview"
@@ -423,7 +415,7 @@ def _get_schema_version(cursor):
         "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'"
     )
     if cursor.fetchone() is None:
-        # No version table -- check if this is a pre-versioning database
+        # No version table — check if this is a pre-versioning database
         cursor.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='energy_status'"
         )
@@ -478,7 +470,7 @@ def init_db():
             logger.error(
                 f"Database schema version ({current_version}) is newer than "
                 f"application target ({target_version}). "
-                "Refusing to downgrade -- please update the application."
+                "Refusing to downgrade — please update the application."
             )
             raise RuntimeError(
                 f"Database schema version {current_version} is newer than "
@@ -553,69 +545,6 @@ def parse_value(value):
 STATNETT_API_RETRIES = 3
 
 
-def _median(values):
-    """Return the median of a list of numbers."""
-    if not values:
-        return 0.0
-    s = sorted(values)
-    n = len(s)
-    if n % 2 == 1:
-        return s[n // 2]
-    return (s[n // 2 - 1] + s[n // 2]) / 2.0
-
-
-def _is_spike(new_value_gw, recent_values_gw):
-    """Check if a new value is an anomalous spike (drop) compared to recent data.
-
-    Returns True if the value should be rejected.
-    """
-    if len(recent_values_gw) < 3:
-        return False  # Not enough history to judge
-
-    med = _median(recent_values_gw)
-    if med < SPIKE_MIN_MEDIAN_GW:
-        return False  # Values are genuinely low, don't filter
-
-    if new_value_gw < med * SPIKE_THRESHOLD:
-        return True  # Anomalous drop
-
-    return False
-
-
-def _check_energy_spike(cursor, country, production_gw, consumption_gw):
-    """Query recent data and check if the new values are anomalous spikes.
-
-    Returns True if the data point should be REJECTED.
-    """
-    cursor.execute('''
-        SELECT production, consumption FROM energy_status
-        WHERE country = ? ORDER BY timestamp DESC LIMIT ?
-    ''', (country, SPIKE_LOOKBACK))
-    rows = cursor.fetchall()
-
-    if len(rows) < 3:
-        return False  # Not enough history
-
-    recent_prod = [r['production'] for r in rows if r['production'] is not None]
-    recent_cons = [r['consumption'] for r in rows if r['consumption'] is not None]
-
-    prod_spike = _is_spike(production_gw, recent_prod)
-    cons_spike = _is_spike(consumption_gw, recent_cons)
-
-    # Reject if BOTH production and consumption spike simultaneously
-    # (a single metric dropping could be legitimate, but both at once is API garbage)
-    if prod_spike and cons_spike:
-        return True
-
-    # Also reject if production alone has an extreme drop (> 90% below median)
-    if recent_prod:
-        med_prod = _median(recent_prod)
-        if med_prod >= SPIKE_MIN_MEDIAN_GW and production_gw < med_prod * 0.10:
-            return True
-
-    return False
-
-
 def fetch_and_store_data():
     """Fetch data from Statnett API"""
     global last_fetch_time, last_fetch_status
@@ -661,14 +590,6 @@ def fetch_and_store_data():
 
                 import_val = exchange / 1000 if exchange >= 0 else 0
                 export_val = abs(exchange) / 1000 if exchange < 0 else 0
-
-                # Spike detection: reject anomalous data points
-                if _check_energy_spike(cursor, country_code, production / 1000, consumption / 1000):
-                    logger.warning(
-                        f"Spike detected for {country_code}: "
-                        f"prod={production / 1000:.2f} GW, cons={consumption / 1000:.2f} GW -- skipping"
-                    )
-                    continue
 
                 cursor.execute('''
                     INSERT OR REPLACE INTO energy_status
@@ -838,90 +759,6 @@ def cleanup_old_data():
             logger.info("Old data cleanup completed")
     except Exception as e:
         logger.error(f"Data cleanup failed: {e}")
-
-
-def cleanup_anomalous_data():
-    """Scan existing data and remove anomalous spike records.
-
-    Uses a sliding window approach: for each data point, compare it against
-    the median of its neighbors.  If the value is far below the local median,
-    it is considered a spike and deleted.
-    """
-    logger.info("Running anomalous data cleanup...")
-    total_deleted = 0
-
-    try:
-        with get_db() as conn:
-            cursor = conn.cursor()
-
-            for country_code in COUNTRIES.keys():
-                cursor.execute('''
-                    SELECT id, timestamp, production, consumption
-                    FROM energy_status WHERE country = ?
-                    ORDER BY timestamp ASC
-                ''', (country_code,))
-                rows = cursor.fetchall()
-
-                if len(rows) < 7:
-                    continue
-
-                ids_to_delete = []
-                for i in range(len(rows)):
-                    neighbor_prod = []
-                    neighbor_cons = []
-                    for j in range(max(0, i - 3), min(len(rows), i + 4)):
-                        if j != i:
-                            if rows[j]['production'] is not None:
-                                neighbor_prod.append(rows[j]['production'])
-                            if rows[j]['consumption'] is not None:
-                                neighbor_cons.append(rows[j]['consumption'])
-
-                    if len(neighbor_prod) < 3:
-                        continue
-
-                    med_prod = _median(neighbor_prod)
-                    med_cons = _median(neighbor_cons) if neighbor_cons else 0
-
-                    prod = rows[i]['production'] or 0
-                    cons = rows[i]['consumption'] or 0
-
-                    if (med_prod >= SPIKE_MIN_MEDIAN_GW and prod < med_prod * SPIKE_THRESHOLD
-                            and med_cons >= SPIKE_MIN_MEDIAN_GW and cons < med_cons * SPIKE_THRESHOLD):
-                        ids_to_delete.append(rows[i]['id'])
-                    elif med_prod >= SPIKE_MIN_MEDIAN_GW and prod < med_prod * 0.10:
-                        ids_to_delete.append(rows[i]['id'])
-
-                if ids_to_delete:
-                    placeholders = ','.join('?' * len(ids_to_delete))
-                    cursor.execute(
-                        f'SELECT DISTINCT timestamp FROM energy_status WHERE id IN ({placeholders})',
-                        ids_to_delete
-                    )
-                    spike_timestamps = [r['timestamp'] for r in cursor.fetchall()]
-
-                    cursor.execute(
-                        f'DELETE FROM energy_status WHERE id IN ({placeholders})',
-                        ids_to_delete
-                    )
-
-                    if spike_timestamps:
-                        ts_placeholders = ','.join('?' * len(spike_timestamps))
-                        cursor.execute(
-                            f'DELETE FROM energy_types WHERE country = ? AND timestamp IN ({ts_placeholders})',
-                            [country_code] + spike_timestamps
-                        )
-
-                total_deleted += len(ids_to_delete)
-                logger.info(
-                    f"Anomaly cleanup: {country_code} - removed {len(ids_to_delete)} spike records"
-                )
-
-            conn.commit()
-
-        logger.info(f"Anomalous data cleanup complete: {total_deleted} records removed")
-
-    except Exception as e:
-        logger.error(f"Anomalous data cleanup failed: {e}")
 
 
 # =============================================================================
@@ -1585,11 +1422,6 @@ def start_scheduler():
         fetch_and_store_data()
     except Exception as e:
         logger.error(f"Initial data fetch failed: {e}")
-
-    try:
-        cleanup_anomalous_data()
-    except Exception as e:
-        logger.error(f"Initial anomalous data cleanup failed: {e}")
 
     try:
         fetch_and_store_prices()
