@@ -1056,7 +1056,12 @@ def get_today_prices(country):
     now = datetime.now(timezone.utc)
     for row in reversed(today_rows):
         ts_str = row['timestamp']
-        ts = datetime.strptime(ts_str.replace('T', ' ').split('.')[0], '%Y-%m-%d %H:%M:%S') if ts_str else None
+        try:
+            ts = datetime.strptime(
+                ts_str.replace('T', ' ').split('.')[0], '%Y-%m-%d %H:%M:%S'
+            ).replace(tzinfo=timezone.utc) if ts_str else None
+        except (ValueError, AttributeError):
+            ts = None
         if ts and ts <= now:
             price_mwh = row['price'] or 0
             current_price = {
