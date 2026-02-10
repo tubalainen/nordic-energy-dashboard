@@ -8,9 +8,9 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.0/dist/chart.umd.min.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2.2.0/dist/chartjs-plugin-datalabels.min.js" crossorigin="anonymous"></script>
 </head>
 <body>
     <div class="app-container">
@@ -59,7 +59,7 @@
                     <div class="country-selector">
                         {% for code, name in countries.items() %}
                         <label class="country-chip">
-                            <input type="checkbox" name="country" value="{{ code }}" checked>
+                            <input type="checkbox" name="country" value="{{ code }}">
                             <span class="chip-content">
                                 <span class="flag flag-{{ code|lower }}"></span>
                                 {{ name }}
@@ -189,22 +189,22 @@
                     <h3>Country Line Styles</h3>
                     <div class="country-line-legend">
                         <div class="country-line-item">
-                            <span class="line-sample solid" style="background: #3b82f6;"></span>
+                            <span class="line-sample solid"></span>
                             <span class="flag flag-se"></span>
                             Sweden (solid)
                         </div>
                         <div class="country-line-item">
-                            <span class="line-sample dashed" style="background: #ef4444;"></span>
+                            <span class="line-sample dashed"></span>
                             <span class="flag flag-no"></span>
                             Norway (dashed)
                         </div>
                         <div class="country-line-item">
-                            <span class="line-sample dotted" style="background: #22c55e;"></span>
+                            <span class="line-sample dotted"></span>
                             <span class="flag flag-fi"></span>
                             Finland (dotted)
                         </div>
                         <div class="country-line-item">
-                            <span class="line-sample dash-dot" style="background: #eab308;"></span>
+                            <span class="line-sample dash-dot"></span>
                             <span class="flag flag-dk"></span>
                             Denmark (dash-dot)
                         </div>

@@ -1,3 +1,32 @@
 __pycache__/
 *.pyc
 *.pyo
+
+# Environment & secrets
+.env
+.env.*
+
+# Database files
+*.db
+*.sqlite3
+
+# Python virtual environment
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Node (if applicable)
+node_modules/

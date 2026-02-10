@@ -50,7 +50,6 @@ let scatterChart = null;
 let todayPriceChart = null;
 let selectedZone = null;
 let selectedEnergyType = 'wind';
-let countryZones = {};
 
 // Currency & exchange rate state
 let selectedCurrency = settings.defaultCurrency || 'SEK';
@@ -164,9 +163,9 @@ const pieChartOptions = {
                 const dataset = context.chart.data.datasets[0];
                 const total = dataset.data.reduce((acc, val) => acc + val, 0);
                 if (total === 0 || value === 0) return '';
-                const percentage = ((value / total) * 100).toFixed(1);
-                if (percentage < 5) return '';
-                return percentage + '%';
+                const pct = (value / total) * 100;
+                if (pct < 5) return '';
+                return pct.toFixed(1) + '%';
             },
             anchor: 'center', align: 'center', offset: 0,
             textShadowBlur: 4, textShadowColor: 'rgba(0, 0, 0, 0.5)'
@@ -186,6 +185,22 @@ const pieChartOptions = {
         }
     }
 };
+
+// =============================================================================
+// UTILITIES
+// =============================================================================
+
+function debounce(fn, delay) {
+    let timer;
+    return function(...args) {
+        clearTimeout(timer);
+        timer = setTimeout(() => fn.apply(this, args), delay);
+    };
+}
+
+// Debounced versions of data loaders to prevent rapid-fire API calls
+const debouncedLoadData = debounce(() => { loadData(); }, 300);
+const debouncedLoadCorrelation = debounce(() => { loadCorrelationData(); }, 300);
 
 // =============================================================================
 // INITIALIZATION
@@ -217,9 +232,9 @@ function initializeControls() {
             } else {
                 selectedCountries = selectedCountries.filter(c => c !== e.target.value);
             }
-            loadData();
+            debouncedLoadData();
             updateZoneSelector();
-            loadCorrelationData();
+            debouncedLoadCorrelation();
         });
     });
 
@@ -232,8 +247,8 @@ function initializeControls() {
             document.querySelectorAll('.time-btn').forEach(b => b.classList.remove('active'));
             e.target.classList.add('active');
             selectedDays = parseInt(e.target.dataset.days);
-            loadData();
-            loadCorrelationData();
+            debouncedLoadData();
+            debouncedLoadCorrelation();
         });
     });
 
@@ -252,26 +267,47 @@ function initializeControls() {
     });
 }
 
+function cloneChartOptions(base) {
+    // Deep clone chart options while preserving callback functions
+    const clone = structuredClone({
+        responsive: base.responsive,
+        maintainAspectRatio: base.maintainAspectRatio,
+        interaction: base.interaction,
+        scales: {
+            x: { ...base.scales.x, time: { ...base.scales.x.time, displayFormats: { ...base.scales.x.time.displayFormats } }, grid: { ...base.scales.x.grid }, ticks: { maxTicksLimit: base.scales.x.ticks.maxTicksLimit } },
+            y: { beginAtZero: base.scales.y.beginAtZero, grid: { ...base.scales.y.grid } }
+        }
+    });
+    // Re-attach callbacks (not cloneable)
+    clone.plugins = {
+        legend: { display: false },
+        datalabels: { display: false },
+        tooltip: { ...base.plugins.tooltip, callbacks: { ...base.plugins.tooltip.callbacks } }
+    };
+    clone.scales.y.ticks = { callback: base.scales.y.ticks.callback };
+    return clone;
+}
+
 function initializeCharts() {
     const statusCtx = document.getElementById('statusChart').getContext('2d');
     statusChart = new Chart(statusCtx, {
         type: 'line',
         data: { datasets: [] },
-        options: JSON.parse(JSON.stringify(lineChartOptions))
+        options: cloneChartOptions(lineChartOptions)
     });
 
     const typesCtx = document.getElementById('typesChart').getContext('2d');
     typesChart = new Chart(typesCtx, {
         type: 'line',
         data: { datasets: [] },
-        options: JSON.parse(JSON.stringify(lineChartOptions))
+        options: cloneChartOptions(lineChartOptions)
     });
 }
 
 function initializeCorrelationCharts() {
     // Spot Price line chart
     const priceCtx = document.getElementById('priceChart').getContext('2d');
-    const priceOpts = JSON.parse(JSON.stringify(lineChartOptions));
+    const priceOpts = cloneChartOptions(lineChartOptions);
     priceOpts.plugins.tooltip.callbacks.label = function(context) {
         return `${context.dataset.label}: ${context.parsed.y?.toFixed(4) || 0} EUR/kWh`;
     };
@@ -394,7 +430,6 @@ async function updateZoneSelector() {
         if (!response.ok) return;
         const data = await response.json();
 
-        countryZones = data;
         zoneSelector.innerHTML = '';
 
         for (const zone of data.zones) {
@@ -631,23 +666,7 @@ function updateCurrentSpotPriceTile(data) {
 }
 
 function initializeSettingsModal() {
-    let settingsBtn = document.getElementById('settingsBtn');
-    if (!settingsBtn) {
-        const header = document.querySelector('.header-right') || document.querySelector('header');
-        if (header) {
-            settingsBtn = document.createElement('button');
-            settingsBtn.id = 'settingsBtn';
-            settingsBtn.className = 'settings-btn';
-            settingsBtn.innerHTML = `
-                <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
-                    <circle cx="12" cy="12" r="3"></circle>
-                    <path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"></path>
-                </svg>
-            `;
-            settingsBtn.title = 'Settings';
-            header.insertBefore(settingsBtn, header.firstChild);
-        }
-    }
+    const settingsBtn = document.getElementById('settingsBtn');
 
     if (!document.getElementById('settingsModal')) {
         const modal = document.createElement('div');
@@ -753,79 +772,85 @@ async function loadData() {
         currentData = await currentResponse.json();
         renderCurrentValues(currentData);
 
-        // Load historical data
+        // Load historical data for all countries in parallel
         const statusDatasets = [];
         const typesDatasets = [];
 
-        for (const country of selectedCountries) {
+        const countryFetches = selectedCountries.map(async (country) => {
             const countryStyle = countryStyles[country];
 
-            // Fetch status data
-            try {
-                const statusResponse = await fetch(`/api/status/${country}?days=${selectedDays}`);
-                if (!statusResponse.ok) continue;
-                const statusData = await statusResponse.json();
+            // Fetch status and types in parallel per country
+            const [statusResponse, typesResponse] = await Promise.all([
+                fetch(`/api/status/${country}?days=${selectedDays}`).catch(() => null),
+                fetch(`/api/types/${country}?days=${selectedDays}`).catch(() => null)
+            ]);
 
-                if (statusData.data && statusData.data.length > 0) {
-                    const countryName = statusData.country_name;
-                    const productionData = [], consumptionData = [], importData = [], exportData = [];
+            // Process status data
+            if (statusResponse && statusResponse.ok) {
+                try {
+                    const statusData = await statusResponse.json();
+                    if (statusData.data && statusData.data.length > 0) {
+                        const countryName = statusData.country_name;
+                        const productionData = [], consumptionData = [], importData = [], exportData = [];
 
-                    for (const d of statusData.data) {
-                        const date = parseTimestamp(d.timestamp);
-                        if (date) {
-                            productionData.push({ x: date, y: d.production || 0 });
-                            consumptionData.push({ x: date, y: d.consumption || 0 });
-                            importData.push({ x: date, y: d.import || 0 });
-                            exportData.push({ x: date, y: d.export || 0 });
+                        for (const d of statusData.data) {
+                            const date = parseTimestamp(d.timestamp);
+                            if (date) {
+                                productionData.push({ x: date, y: d.production || 0 });
+                                consumptionData.push({ x: date, y: d.consumption || 0 });
+                                importData.push({ x: date, y: d.import || 0 });
+                                exportData.push({ x: date, y: d.export || 0 });
+                            }
                         }
+
+                        const pointRadius = productionData.length < 10 ? 6 : productionData.length < 50 ? 4 : 2;
+                        const baseProps = { borderWidth: 2, borderDash: countryStyle.lineStyle, tension: 0.3, pointRadius, pointHoverRadius: pointRadius + 2, country };
+
+                        statusDatasets.push({ label: `${countryName} - Production`, data: productionData, borderColor: statusColors.production.border, backgroundColor: statusColors.production.background, ...baseProps, metricType: 'production' });
+                        statusDatasets.push({ label: `${countryName} - Consumption`, data: consumptionData, borderColor: statusColors.consumption.border, backgroundColor: statusColors.consumption.background, ...baseProps, metricType: 'consumption' });
+                        statusDatasets.push({ label: `${countryName} - Import`, data: importData, borderColor: statusColors.import.border, backgroundColor: statusColors.import.background, ...baseProps, metricType: 'import' });
+                        statusDatasets.push({ label: `${countryName} - Export`, data: exportData, borderColor: statusColors.export.border, backgroundColor: statusColors.export.background, ...baseProps, metricType: 'export' });
                     }
-
-                    const pointRadius = productionData.length < 10 ? 6 : productionData.length < 50 ? 4 : 2;
-                    const baseProps = { borderWidth: 2, borderDash: countryStyle.lineStyle, tension: 0.3, pointRadius, pointHoverRadius: pointRadius + 2, country };
-
-                    statusDatasets.push({ label: `${countryName} - Production`, data: productionData, borderColor: statusColors.production.border, backgroundColor: statusColors.production.background, ...baseProps, metricType: 'production' });
-                    statusDatasets.push({ label: `${countryName} - Consumption`, data: consumptionData, borderColor: statusColors.consumption.border, backgroundColor: statusColors.consumption.background, ...baseProps, metricType: 'consumption' });
-                    statusDatasets.push({ label: `${countryName} - Import`, data: importData, borderColor: statusColors.import.border, backgroundColor: statusColors.import.background, ...baseProps, metricType: 'import' });
-                    statusDatasets.push({ label: `${countryName} - Export`, data: exportData, borderColor: statusColors.export.border, backgroundColor: statusColors.export.background, ...baseProps, metricType: 'export' });
+                } catch (err) {
+                    console.error(`Error processing status for ${country}:`, err);
                 }
-            } catch (err) {
-                console.error(`Error fetching status for ${country}:`, err);
             }
 
-            // Fetch types data
-            try {
-                const typesResponse = await fetch(`/api/types/${country}?days=${selectedDays}`);
-                if (!typesResponse.ok) continue;
-                const typesData = await typesResponse.json();
+            // Process types data
+            if (typesResponse && typesResponse.ok) {
+                try {
+                    const typesData = await typesResponse.json();
+                    if (typesData.data && typesData.data.length > 0) {
+                        const countryName = typesData.country_name;
+                        const nuclearData = [], hydroData = [], windData = [], thermalData = [], otherData = [];
 
-                if (typesData.data && typesData.data.length > 0) {
-                    const countryName = typesData.country_name;
-                    const nuclearData = [], hydroData = [], windData = [], thermalData = [], otherData = [];
-
-                    for (const d of typesData.data) {
-                        const date = parseTimestamp(d.timestamp);
-                        if (date) {
-                            nuclearData.push({ x: date, y: d.nuclear || 0 });
-                            hydroData.push({ x: date, y: d.hydro || 0 });
-                            windData.push({ x: date, y: d.wind || 0 });
-                            thermalData.push({ x: date, y: d.thermal || 0 });
-                            otherData.push({ x: date, y: d.not_specified || 0 });
+                        for (const d of typesData.data) {
+                            const date = parseTimestamp(d.timestamp);
+                            if (date) {
+                                nuclearData.push({ x: date, y: d.nuclear || 0 });
+                                hydroData.push({ x: date, y: d.hydro || 0 });
+                                windData.push({ x: date, y: d.wind || 0 });
+                                thermalData.push({ x: date, y: d.thermal || 0 });
+                                otherData.push({ x: date, y: d.not_specified || 0 });
+                            }
                         }
+
+                        const pointRadius = nuclearData.length < 10 ? 6 : nuclearData.length < 50 ? 4 : 2;
+                        const baseProps = { borderWidth: 2, borderDash: countryStyle.lineStyle, tension: 0.3, pointRadius, pointHoverRadius: pointRadius + 2, country };
+
+                        typesDatasets.push({ label: `${countryName} - Nuclear`, data: nuclearData, borderColor: typeColors.nuclear.border, backgroundColor: typeColors.nuclear.background, ...baseProps, metricType: 'nuclear' });
+                        typesDatasets.push({ label: `${countryName} - Hydro`, data: hydroData, borderColor: typeColors.hydro.border, backgroundColor: typeColors.hydro.background, ...baseProps, metricType: 'hydro' });
+                        typesDatasets.push({ label: `${countryName} - Wind`, data: windData, borderColor: typeColors.wind.border, backgroundColor: typeColors.wind.background, ...baseProps, metricType: 'wind' });
+                        typesDatasets.push({ label: `${countryName} - Thermal`, data: thermalData, borderColor: typeColors.thermal.border, backgroundColor: typeColors.thermal.background, ...baseProps, metricType: 'thermal' });
+                        typesDatasets.push({ label: `${countryName} - Other`, data: otherData, borderColor: typeColors.not_specified.border, backgroundColor: typeColors.not_specified.background, ...baseProps, metricType: 'not_specified' });
                     }
-
-                    const pointRadius = nuclearData.length < 10 ? 6 : nuclearData.length < 50 ? 4 : 2;
-                    const baseProps = { borderWidth: 2, borderDash: countryStyle.lineStyle, tension: 0.3, pointRadius, pointHoverRadius: pointRadius + 2, country };
-
-                    typesDatasets.push({ label: `${countryName} - Nuclear`, data: nuclearData, borderColor: typeColors.nuclear.border, backgroundColor: typeColors.nuclear.background, ...baseProps, metricType: 'nuclear' });
-                    typesDatasets.push({ label: `${countryName} - Hydro`, data: hydroData, borderColor: typeColors.hydro.border, backgroundColor: typeColors.hydro.background, ...baseProps, metricType: 'hydro' });
-                    typesDatasets.push({ label: `${countryName} - Wind`, data: windData, borderColor: typeColors.wind.border, backgroundColor: typeColors.wind.background, ...baseProps, metricType: 'wind' });
-                    typesDatasets.push({ label: `${countryName} - Thermal`, data: thermalData, borderColor: typeColors.thermal.border, backgroundColor: typeColors.thermal.background, ...baseProps, metricType: 'thermal' });
-                    typesDatasets.push({ label: `${countryName} - Other`, data: otherData, borderColor: typeColors.not_specified.border, backgroundColor: typeColors.not_specified.background, ...baseProps, metricType: 'not_specified' });
+                } catch (err) {
+                    console.error(`Error processing types for ${country}:`, err);
                 }
-            } catch (err) {
-                console.error(`Error fetching types for ${country}:`, err);
             }
-        }
+        });
+
+        await Promise.all(countryFetches);
 
         // Update status chart
         const timeUnit = selectedDays <= 7 ? 'hour' : 'day';

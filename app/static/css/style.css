@@ -33,10 +33,6 @@
 
     --transition: all 0.2s ease;
 
-    --flag-se: url('https://flagcdn.com/w40/se.png');
-    --flag-no: url('https://flagcdn.com/w40/no.png');
-    --flag-fi: url('https://flagcdn.com/w40/fi.png');
-    --flag-dk: url('https://flagcdn.com/w40/dk.png');
 }
 
 * {
@@ -515,44 +511,7 @@ body {
     text-decoration: underline;
 }
 
-/* Responsive */
-@media (max-width: 768px) {
-    .header {
-        padding: 1rem;
-    }
-
-    .header-content {
-        flex-direction: column;
-        align-items: flex-start;
-    }
-
-    .main-content {
-        padding: 1rem;
-    }
-
-    .controls-panel {
-        padding: 1rem;
-        gap: 1rem;
-    }
-
-    .refresh-btn {
-        width: 100%;
-        justify-content: center;
-        margin-left: 0;
-    }
-
-    .chart-container {
-        height: 300px;
-    }
-
-    .chart-header {
-        flex-direction: column;
-    }
-
-    .chart-legend {
-        gap: 0.75rem;
-    }
-}
+/* Responsive — all mobile overrides in a single block at end of file */
 
 /* Scrollbar */
 ::-webkit-scrollbar {
@@ -606,22 +565,6 @@ body {
 }
 
 /* No data message */
-.no-data {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    height: 300px;
-    color: var(--text-muted);
-    gap: 1rem;
-}
-
-.no-data svg {
-    width: 64px;
-    height: 64px;
-    opacity: 0.5;
-}
-
 .no-data-text {
     color: var(--text-muted);
     font-size: 0.9rem;
@@ -851,10 +794,11 @@ body {
     width: 30px;
     height: 3px;
     border-radius: 2px;
+    color: var(--text-secondary);
 }
 
 .line-sample.solid {
-    background: currentColor;
+    background: var(--text-secondary);
 }
 
 .line-sample.dashed {
@@ -1201,6 +1145,15 @@ body {
    ============================================================================= */
 
 @media (max-width: 768px) {
+    .header {
+        padding: 1rem;
+    }
+
+    .header-content {
+        flex-direction: column;
+        align-items: flex-start;
+    }
+
     .header-right {
         flex-wrap: wrap;
         gap: 0.5rem;
@@ -1208,6 +1161,33 @@ body {
 
     .settings-btn {
         order: -1;
+    }
+
+    .main-content {
+        padding: 1rem;
+    }
+
+    .controls-panel {
+        padding: 1rem;
+        gap: 1rem;
+    }
+
+    .refresh-btn {
+        width: 100%;
+        justify-content: center;
+        margin-left: 0;
+    }
+
+    .chart-container {
+        height: 300px;
+    }
+
+    .chart-header {
+        flex-direction: column;
+    }
+
+    .chart-legend {
+        gap: 0.75rem;
     }
 
     .country-line-legend {
