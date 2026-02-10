@@ -13,13 +13,15 @@ import sqlite3
 import logging
 import re
 import math
-from datetime import datetime, timedelta
+import time
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 from flask import Flask, render_template, jsonify, request, abort
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from apscheduler.schedulers.background import BackgroundScheduler
 import requests
+import threading
 from contextlib import contextmanager
 
 # =============================================================================
@@ -124,14 +126,13 @@ last_price_fetch_status = None
 last_exchange_rate_fetch_time = None
 last_exchange_rate_fetch_status = None
 
-# Exchange rates (EUR base)
-exchange_rates = {
+# Fallback exchange rates (EUR base) used until first successful fetch
+_FALLBACK_EXCHANGE_RATES = {
     'EUR': 1.0,
-    'SEK': 11.0,   # Fallback defaults
+    'SEK': 11.0,
     'DKK': 7.45,
     'NOK': 11.5
 }
-VALID_CURRENCIES = frozenset(['EUR', 'SEK', 'DKK', 'NOK'])
 
 # =============================================================================
 # SECURITY MIDDLEWARE
@@ -203,6 +204,42 @@ def internal_only(f):
 # =============================================================================
 # INPUT VALIDATION
 # =============================================================================
+
+def format_timestamp(ts):
+    """Ensure timestamp string uses ISO 8601 'T' separator."""
+    if ts and 'T' not in ts:
+        return ts.replace(' ', 'T')
+    return ts
+
+
+def _get_exchange_rates_from_db():
+    """Read exchange rates from the database (shared across workers)."""
+    import json
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT value FROM key_value_store WHERE key = 'exchange_rates'"
+            )
+            row = cursor.fetchone()
+            if row:
+                return json.loads(row['value'])
+    except Exception:
+        pass
+    return dict(_FALLBACK_EXCHANGE_RATES)
+
+
+def _set_exchange_rates_in_db(rates):
+    """Write exchange rates to the database (visible to all workers)."""
+    import json
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO key_value_store (key, value, updated_at)
+            VALUES ('exchange_rates', ?, ?)
+        ''', (json.dumps(rates), datetime.now(timezone.utc)))
+        conn.commit()
+
 
 def validate_country_code(country):
     """Validate and sanitize country code"""
@@ -298,7 +335,7 @@ def get_db():
         conn.close()
 
 
-SCHEMA_TARGET_VERSION = 2
+SCHEMA_TARGET_VERSION = 3
 
 
 def _migrate_v1(cursor):
@@ -352,10 +389,22 @@ def _migrate_v2(cursor):
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_prices_country ON spot_prices(country)')
 
 
+def _migrate_v3(cursor):
+    """Migration v3: Add key_value_store table for cross-worker shared state."""
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS key_value_store (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at DATETIME NOT NULL
+        )
+    ''')
+
+
 # Ordered list of migrations.  Key = target version, value = callable.
 MIGRATIONS = {
     1: _migrate_v1,
     2: _migrate_v2,
+    3: _migrate_v3,
 }
 
 
@@ -403,7 +452,7 @@ def _set_schema_version(cursor, version):
     ''')
     cursor.execute(
         'INSERT INTO schema_version (version, applied_at) VALUES (?, ?)',
-        (version, datetime.utcnow())
+        (version, datetime.now(timezone.utc))
     )
 
 
@@ -501,6 +550,9 @@ def parse_value(value):
         return 0.0
 
 
+STATNETT_API_RETRIES = 3
+
+
 def fetch_and_store_data():
     """Fetch data from Statnett API"""
     global last_fetch_time, last_fetch_status
@@ -508,11 +560,24 @@ def fetch_and_store_data():
     logger.info("Fetching data from Statnett API...")
 
     try:
-        response = requests.get(URL_CONSUMPTION, timeout=30)
-        response.raise_for_status()
+        last_err = None
+        for attempt in range(STATNETT_API_RETRIES):
+            try:
+                response = requests.get(URL_CONSUMPTION, timeout=30)
+                response.raise_for_status()
+                break
+            except Exception as e:
+                last_err = e
+                if attempt < STATNETT_API_RETRIES - 1:
+                    time.sleep(2 ** attempt)
+                    logger.warning(f"Statnett API attempt {attempt + 1} failed: {e}, retrying...")
+                continue
+        else:
+            raise last_err
+
         data = response.json()
 
-        timestamp = datetime.utcnow().replace(second=0, microsecond=0)
+        timestamp = datetime.now(timezone.utc).replace(second=0, microsecond=0)
 
         with get_db() as conn:
             cursor = conn.cursor()
@@ -560,12 +625,12 @@ def fetch_and_store_data():
                       wind / 1000, thermal / 1000, not_specified / 1000))
 
             conn.commit()
-            last_fetch_time = datetime.utcnow()
+            last_fetch_time = datetime.now(timezone.utc)
             last_fetch_status = "success"
             logger.info(f"Data stored for {timestamp}")
 
     except Exception as e:
-        last_fetch_time = datetime.utcnow()
+        last_fetch_time = datetime.now(timezone.utc)
         last_fetch_status = "error"
         logger.error(f"Fetch failed: {e}")
 
@@ -603,7 +668,6 @@ def _fetch_nordpool_day(target_date, zones):
         except Exception as e:
             last_err = e
             if attempt < NORDPOOL_API_RETRIES - 1:
-                import time
                 time.sleep(2 ** attempt)
                 logger.warning(f"Nordpool API attempt {attempt + 1} failed: {e}, retrying...")
             continue
@@ -654,7 +718,7 @@ def fetch_and_store_prices():
 
     try:
         all_zones = list(ZONE_TO_COUNTRY.keys())
-        today = datetime.utcnow().date()
+        today = datetime.now(timezone.utc).date()
         tomorrow = today + timedelta(days=1)
 
         all_results = []
@@ -665,7 +729,7 @@ def fetch_and_store_prices():
         if not all_results:
             logger.warning("No price data returned from Nordpool")
             last_price_fetch_status = "no_data"
-            last_price_fetch_time = datetime.utcnow()
+            last_price_fetch_time = datetime.now(timezone.utc)
             return
 
         with get_db() as conn:
@@ -685,24 +749,29 @@ def fetch_and_store_prices():
                 stored += 1
 
             conn.commit()
-            last_price_fetch_time = datetime.utcnow()
+            last_price_fetch_time = datetime.now(timezone.utc)
             last_price_fetch_status = "success"
             logger.info(f"Stored {stored} price records")
 
     except Exception as e:
-        last_price_fetch_time = datetime.utcnow()
+        last_price_fetch_time = datetime.now(timezone.utc)
         last_price_fetch_status = "error"
         logger.error(f"Price fetch failed: {e}")
 
 
 def cleanup_old_data():
-    cutoff = datetime.utcnow() - timedelta(days=DATA_RETENTION_DAYS)
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute('DELETE FROM energy_status WHERE timestamp < ?', (cutoff,))
-        cursor.execute('DELETE FROM energy_types WHERE timestamp < ?', (cutoff,))
-        cursor.execute('DELETE FROM spot_prices WHERE timestamp < ?', (cutoff,))
-        conn.commit()
+    """Delete data older than DATA_RETENTION_DAYS."""
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=DATA_RETENTION_DAYS)
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM energy_status WHERE timestamp < ?', (cutoff,))
+            cursor.execute('DELETE FROM energy_types WHERE timestamp < ?', (cutoff,))
+            cursor.execute('DELETE FROM spot_prices WHERE timestamp < ?', (cutoff,))
+            conn.commit()
+            logger.info("Old data cleanup completed")
+    except Exception as e:
+        logger.error(f"Data cleanup failed: {e}")
 
 
 # =============================================================================
@@ -711,7 +780,7 @@ def cleanup_old_data():
 
 def fetch_exchange_rates():
     """Fetch EUR->SEK, EUR->DKK, EUR->NOK exchange rates from Frankfurter API (ECB data)"""
-    global exchange_rates, last_exchange_rate_fetch_time, last_exchange_rate_fetch_status
+    global last_exchange_rate_fetch_time, last_exchange_rate_fetch_status
 
     logger.info("Fetching exchange rates...")
 
@@ -724,41 +793,55 @@ def fetch_exchange_rates():
         data = response.json()
 
         rates = data.get('rates', {})
+        new_rates = dict(_FALLBACK_EXCHANGE_RATES)
         if 'SEK' in rates:
-            exchange_rates['SEK'] = float(rates['SEK'])
+            new_rates['SEK'] = float(rates['SEK'])
         if 'DKK' in rates:
-            exchange_rates['DKK'] = float(rates['DKK'])
+            new_rates['DKK'] = float(rates['DKK'])
         if 'NOK' in rates:
-            exchange_rates['NOK'] = float(rates['NOK'])
-        exchange_rates['EUR'] = 1.0
+            new_rates['NOK'] = float(rates['NOK'])
+        new_rates['EUR'] = 1.0
 
-        last_exchange_rate_fetch_time = datetime.utcnow()
+        _set_exchange_rates_in_db(new_rates)
+
+        last_exchange_rate_fetch_time = datetime.now(timezone.utc)
         last_exchange_rate_fetch_status = "success"
-        logger.info(f"Exchange rates updated: EUR->SEK={exchange_rates['SEK']}, EUR->DKK={exchange_rates['DKK']}, EUR->NOK={exchange_rates['NOK']}")
+        logger.info(f"Exchange rates updated: EUR->SEK={new_rates['SEK']}, EUR->DKK={new_rates['DKK']}, EUR->NOK={new_rates['NOK']}")
 
     except Exception as e:
-        last_exchange_rate_fetch_time = datetime.utcnow()
+        last_exchange_rate_fetch_time = datetime.now(timezone.utc)
         last_exchange_rate_fetch_status = "error"
         logger.error(f"Exchange rate fetch failed: {e}")
 
 
+_ensure_prices_lock = threading.Lock()
+
+
 def ensure_today_prices():
-    """Check if today's prices exist in DB; if not, trigger a fetch"""
-    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    """Check if today's prices exist in DB; if not, trigger a fetch.
+    Uses a lock to prevent concurrent requests from all triggering fetches."""
+    if not _ensure_prices_lock.acquire(blocking=False):
+        # Another thread is already fetching — skip
+        return False
 
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT COUNT(*) as count FROM spot_prices
-            WHERE timestamp >= ?
-        ''', (today_start,))
-        count = cursor.fetchone()['count']
+    try:
+        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
 
-    if count == 0:
-        logger.info("No prices for today found, triggering price fetch...")
-        fetch_and_store_prices()
-        return True
-    return False
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT COUNT(*) as count FROM spot_prices
+                WHERE timestamp >= ?
+            ''', (today_start,))
+            count = cursor.fetchone()['count']
+
+        if count == 0:
+            logger.info("No prices for today found, triggering price fetch...")
+            fetch_and_store_prices()
+            return True
+        return False
+    finally:
+        _ensure_prices_lock.release()
 
 
 # =============================================================================
@@ -798,24 +881,24 @@ def get_status(country):
         return jsonify({'error': 'Invalid country code'}), 400
 
     days = validate_days(request.args.get('days'), default=7)
-    start_date = datetime.utcnow() - timedelta(days=days)
+    start_date = datetime.now(timezone.utc) - timedelta(days=days)
+
+    # 288 data points per day at 5-min intervals; add headroom
+    row_limit = days * 300
 
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute('''
             SELECT timestamp, production, consumption, import_value, export_value
             FROM energy_status WHERE country = ? AND timestamp >= ?
-            ORDER BY timestamp ASC LIMIT 10000
-        ''', (country, start_date))
+            ORDER BY timestamp ASC LIMIT ?
+        ''', (country, start_date, row_limit))
         rows = cursor.fetchall()
 
     data = []
     for row in rows:
-        ts = row['timestamp']
-        if ts and 'T' not in ts:
-            ts = ts.replace(' ', 'T')
         data.append({
-            'timestamp': ts,
+            'timestamp': format_timestamp(row['timestamp']),
             'production': row['production'] or 0,
             'consumption': row['consumption'] or 0,
             'import': row['import_value'] or 0,
@@ -837,24 +920,23 @@ def get_types(country):
         return jsonify({'error': 'Invalid country code'}), 400
 
     days = validate_days(request.args.get('days'), default=7)
-    start_date = datetime.utcnow() - timedelta(days=days)
+    start_date = datetime.now(timezone.utc) - timedelta(days=days)
+
+    row_limit = days * 300
 
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute('''
             SELECT timestamp, nuclear, hydro, wind, thermal, not_specified
             FROM energy_types WHERE country = ? AND timestamp >= ?
-            ORDER BY timestamp ASC LIMIT 10000
-        ''', (country, start_date))
+            ORDER BY timestamp ASC LIMIT ?
+        ''', (country, start_date, row_limit))
         rows = cursor.fetchall()
 
     data = []
     for row in rows:
-        ts = row['timestamp']
-        if ts and 'T' not in ts:
-            ts = ts.replace(' ', 'T')
         data.append({
-            'timestamp': ts,
+            'timestamp': format_timestamp(row['timestamp']),
             'nuclear': row['nuclear'] or 0,
             'hydro': row['hydro'] or 0,
             'wind': row['wind'] or 0,
@@ -879,7 +961,10 @@ def get_prices(country):
 
     days = validate_days(request.args.get('days'), default=7)
     zone = validate_zone(request.args.get('zone'), country)
-    start_date = datetime.utcnow() - timedelta(days=days)
+    start_date = datetime.now(timezone.utc) - timedelta(days=days)
+
+    # 24 hourly prices per day; add headroom
+    row_limit = days * 30
 
     with get_db() as conn:
         cursor = conn.cursor()
@@ -887,25 +972,22 @@ def get_prices(country):
             cursor.execute('''
                 SELECT timestamp, price, currency, zone
                 FROM spot_prices WHERE country = ? AND zone = ? AND timestamp >= ?
-                ORDER BY timestamp ASC LIMIT 10000
-            ''', (country, zone, start_date))
+                ORDER BY timestamp ASC LIMIT ?
+            ''', (country, zone, start_date, row_limit))
         else:
             cursor.execute('''
                 SELECT timestamp, AVG(price) as price, currency, 'AVG' as zone
                 FROM spot_prices WHERE country = ? AND timestamp >= ?
                 GROUP BY timestamp
-                ORDER BY timestamp ASC LIMIT 10000
-            ''', (country, start_date))
+                ORDER BY timestamp ASC LIMIT ?
+            ''', (country, start_date, row_limit))
         rows = cursor.fetchall()
 
     data = []
     for row in rows:
-        ts = row['timestamp']
-        if ts and 'T' not in ts:
-            ts = ts.replace(' ', 'T')
         price_mwh = row['price'] or 0
         data.append({
-            'timestamp': ts,
+            'timestamp': format_timestamp(row['timestamp']),
             'price': price_mwh / 1000.0,
             'currency': row['currency'] or 'EUR',
             'zone': row['zone']
@@ -934,7 +1016,7 @@ def get_today_prices(country):
     # Ensure we have today's prices
     ensure_today_prices()
 
-    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     tomorrow_start = today_start + timedelta(days=1)
     day_after_tomorrow = tomorrow_start + timedelta(days=1)
 
@@ -957,15 +1039,12 @@ def get_today_prices(country):
         ''', (zone, tomorrow_start, day_after_tomorrow))
         tomorrow_rows = cursor.fetchall()
 
-    def format_rows(rows):
+    def _format_price_rows(rows):
         result = []
         for row in rows:
-            ts = row['timestamp']
-            if ts and 'T' not in ts:
-                ts = ts.replace(' ', 'T')
             price_mwh = row['price'] or 0
             result.append({
-                'timestamp': ts,
+                'timestamp': format_timestamp(row['timestamp']),
                 'price': price_mwh / 1000.0,
                 'currency': row['currency'] or 'EUR',
                 'zone': row['zone']
@@ -974,8 +1053,7 @@ def get_today_prices(country):
 
     # Find current price (closest hour <= now)
     current_price = None
-    now = datetime.utcnow()
-    current_hour = now.replace(minute=0, second=0, microsecond=0)
+    now = datetime.now(timezone.utc)
     for row in reversed(today_rows):
         ts_str = row['timestamp']
         ts = datetime.strptime(ts_str.replace('T', ' ').split('.')[0], '%Y-%m-%d %H:%M:%S') if ts_str else None
@@ -984,7 +1062,7 @@ def get_today_prices(country):
             current_price = {
                 'price': price_mwh / 1000.0,
                 'currency': row['currency'] or 'EUR',
-                'timestamp': ts_str.replace(' ', 'T') if ts_str and 'T' not in ts_str else ts_str
+                'timestamp': format_timestamp(ts_str)
             }
             break
 
@@ -994,8 +1072,8 @@ def get_today_prices(country):
         'zone': zone,
         'today_date': today_start.strftime('%Y-%m-%d'),
         'tomorrow_date': tomorrow_start.strftime('%Y-%m-%d'),
-        'today': format_rows(today_rows),
-        'tomorrow': format_rows(tomorrow_rows) if tomorrow_rows else None,
+        'today': _format_price_rows(today_rows),
+        'tomorrow': _format_price_rows(tomorrow_rows) if tomorrow_rows else None,
         'current_price': current_price,
         'has_tomorrow': len(tomorrow_rows) > 0
     })
@@ -1005,11 +1083,11 @@ def get_today_prices(country):
 @limiter.limit(RATE_LIMIT_API)
 def get_exchange_rates():
     """Return current exchange rates (EUR base)"""
+    rates = _get_exchange_rates_from_db()
     return jsonify({
         'base': 'EUR',
-        'rates': exchange_rates,
-        'last_updated': str(last_exchange_rate_fetch_time) if last_exchange_rate_fetch_time else None,
-        'status': last_exchange_rate_fetch_status
+        'rates': rates,
+        'status': 'ok'
     })
 
 
@@ -1030,7 +1108,7 @@ def get_correlation(country):
     if not zone:
         zone = DEFAULT_ZONE.get(country, 'SE3')
 
-    start_date = datetime.utcnow() - timedelta(days=days)
+    start_date = datetime.now(timezone.utc) - timedelta(days=days)
 
     with get_db() as conn:
         cursor = conn.cursor()
@@ -1044,15 +1122,20 @@ def get_correlation(country):
         price_rows = cursor.fetchall()
 
         # Get energy type data aggregated to hourly
-        # energy_type is validated against VALID_ENERGY_TYPES whitelist
-        query = '''
-            SELECT strftime('%%Y-%%m-%%d %%H:00:00', timestamp) as hour_ts,
+        # Use a safe column mapping instead of string formatting into SQL
+        _ENERGY_TYPE_COLUMNS = {
+            'nuclear': 'nuclear', 'hydro': 'hydro', 'wind': 'wind',
+            'thermal': 'thermal', 'not_specified': 'not_specified',
+        }
+        col = _ENERGY_TYPE_COLUMNS[energy_type]  # KeyError impossible: validated above
+        query = f'''
+            SELECT strftime('%Y-%m-%d %H:00:00', timestamp) as hour_ts,
                    AVG({col}) as energy_value
             FROM energy_types
             WHERE country = ? AND timestamp >= ?
             GROUP BY hour_ts
             ORDER BY hour_ts ASC
-        '''.format(col=energy_type)
+        '''
         cursor.execute(query, (country, start_date))
         energy_rows = cursor.fetchall()
 
@@ -1073,12 +1156,9 @@ def get_correlation(country):
             price_val = row['price']
             energy_val = energy_by_hour[hour_key]
             if price_val is not None and energy_val is not None:
-                display_ts = ts
-                if display_ts and 'T' not in display_ts:
-                    display_ts = display_ts.replace(' ', 'T')
                 price_kwh = price_val / 1000.0
                 paired.append({
-                    'timestamp': display_ts,
+                    'timestamp': format_timestamp(ts),
                     'price': price_kwh,
                     'energy_value': energy_val
                 })
@@ -1117,7 +1197,7 @@ def get_correlation_summary(country):
     if not zone:
         zone = DEFAULT_ZONE.get(country, 'SE3')
 
-    start_date = datetime.utcnow() - timedelta(days=days)
+    start_date = datetime.now(timezone.utc) - timedelta(days=days)
 
     with get_db() as conn:
         cursor = conn.cursor()
@@ -1273,6 +1353,18 @@ def get_stats():
 # INTERNAL-ONLY ROUTES
 # =============================================================================
 
+@app.route('/health')
+@limiter.exempt
+def health_check_public():
+    """Lightweight health check for Docker/load-balancers (no rate limit)."""
+    try:
+        with get_db() as conn:
+            conn.execute('SELECT 1')
+        return jsonify({'status': 'healthy'}), 200
+    except Exception:
+        return jsonify({'status': 'unhealthy'}), 500
+
+
 @app.route('/internal/health')
 @internal_only
 def health_check():
@@ -1298,7 +1390,7 @@ def get_debug():
         'last_price_fetch_status': last_price_fetch_status,
         'last_exchange_rate_fetch_time': str(last_exchange_rate_fetch_time) if last_exchange_rate_fetch_time else None,
         'last_exchange_rate_fetch_status': last_exchange_rate_fetch_status,
-        'exchange_rates': exchange_rates
+        'exchange_rates': _get_exchange_rates_from_db()
     })
 
 

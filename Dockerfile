@@ -11,14 +11,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONFAULTHANDLER=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    TZ=UTC
+    TZ=Europe/Stockholm
 
 WORKDIR /app
-
-# Install system dependencies (minimal)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean
 
 # Copy requirements first for layer caching
 COPY requirements.txt .
@@ -44,7 +39,7 @@ EXPOSE 5000
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/api/stats')" || exit 1
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/health')" || exit 1
 
 # Run with gunicorn (production WSGI server)
 # --preload ensures init_db and start_scheduler run once before forking
