@@ -1,10 +1,12 @@
-# Nordic Energy Dashboard - Hardened Docker Compose Configuration
+# Nordic Energy Dashboard - Docker Compose Configuration
 # Designed to run behind your existing Nginx reverse proxy + Cloudflare
 # Also accessible directly on LAN via port 5050
 
 services:
   nordic-energy-dashboard:
-    build: .
+    image: ghcr.io/tubalainen/nordic-energy-dashboard:main
+    # To build locally instead, comment out 'image' above and uncomment 'build':
+    # build: .
     container_name: nordic-energy-dashboard
     restart: unless-stopped
     ports:

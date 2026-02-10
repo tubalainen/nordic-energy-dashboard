@@ -15,16 +15,25 @@ LAN Users ───────────────────────�
 ## Quick Start
 
 ```bash
-# Extract and enter directory
-unzip nordic-energy-dashboard-secure.zip
-cd nordic-energy-dashboard-secure
+# Clone the repository
+git clone https://github.com/tubalainen/nordic-energy-dashboard.git
+cd nordic-energy-dashboard
 
-# Start the container
+# Start the container (pulls image from GitHub Container Registry)
 docker-compose up -d
 
 # Verify it's running
 docker-compose ps
 docker-compose logs -f
+```
+
+The default `docker-compose.yml` pulls the pre-built image from `ghcr.io/tubalainen/nordic-energy-dashboard:main`. To build locally instead, edit `docker-compose.yml` and swap the `image` / `build` lines:
+
+```yaml
+services:
+  nordic-energy-dashboard:
+    # image: ghcr.io/tubalainen/nordic-energy-dashboard:main
+    build: .
 ```
 
 **Access:**
@@ -348,10 +357,13 @@ docker-compose logs -f    # View logs
 ### Health Check
 
 ```bash
-# Local check
+# Public health endpoint (no rate limit)
+curl http://127.0.0.1:5050/health
+
+# Stats endpoint
 curl http://127.0.0.1:5050/api/stats
 
-# With internal header
+# Internal health endpoint (requires header)
 curl -H "X-Internal-Request: true" http://127.0.0.1:5050/internal/health
 ```
 
@@ -372,9 +384,24 @@ docker-compose up -d
 ### Update Container
 
 ```bash
-docker-compose down
-docker-compose build --no-cache
+# Pull latest image and restart
+docker-compose pull
 docker-compose up -d
+
+# Or if building locally:
+# docker-compose down
+# docker-compose build --no-cache
+# docker-compose up -d
+```
+
+### Using a Specific Version
+
+Tagged releases are available as container images. To pin to a version:
+
+```yaml
+services:
+  nordic-energy-dashboard:
+    image: ghcr.io/tubalainen/nordic-energy-dashboard:v1.5
 ```
 
 ---
