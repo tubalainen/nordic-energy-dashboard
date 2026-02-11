@@ -210,17 +210,20 @@ const debouncedLoadCorrelation = debounce(() => { loadCorrelationData(); }, 300)
 // SPIKE FILTERING (Frontend - Rolling Median + MAD)
 // =============================================================================
 
-function filterSpikes(dataPoints, thresholdK = 3.0, windowSize = 24, fallbackPct = 0.30) {
+function filterSpikes(dataPoints, thresholdK = 3.5, windowSize = 24, fallbackPct = 0.35) {
     /**
      * Filter spike values from an array of {x, y} points.
-     * Uses a clean-window approach: only accepted (non-spike) values are used
-     * for median + MAD computation, preventing consecutive spikes from
-     * contaminating the detection window.
+     * Uses a clean-window approach with a consecutive-rejection safety valve:
+     * only accepted values feed the window, but if more than maxConsecutiveRejects
+     * points are rejected in a row, we treat it as a legitimate level shift
+     * and accept the value (resetting the window).
      */
     if (!dataPoints || dataPoints.length < 4) return dataPoints;
 
     const filtered = [];
     const cleanValues = [];
+    const maxConsecutiveRejects = 3;
+    let consecutiveRejects = 0;
 
     for (let i = 0; i < dataPoints.length; i++) {
         if (cleanValues.length < 3) {
@@ -229,9 +232,9 @@ function filterSpikes(dataPoints, thresholdK = 3.0, windowSize = 24, fallbackPct
             continue;
         }
 
-        const window = cleanValues.slice(-windowSize);
+        const win = cleanValues.slice(-windowSize);
 
-        const sorted = [...window].sort((a, b) => a - b);
+        const sorted = [...win].sort((a, b) => a - b);
         const mid = Math.floor(sorted.length / 2);
         const median = sorted.length % 2 === 0
             ? (sorted[mid - 1] + sorted[mid]) / 2
@@ -257,9 +260,18 @@ function filterSpikes(dataPoints, thresholdK = 3.0, windowSize = 24, fallbackPct
             }
         }
 
-        if (!isSpike) {
+        if (isSpike) {
+            consecutiveRejects++;
+            // Safety valve: if too many consecutive rejects, this is a level shift
+            if (consecutiveRejects > maxConsecutiveRejects) {
+                filtered.push(dataPoints[i]);
+                cleanValues.push(dataPoints[i].y);
+                consecutiveRejects = 0;
+            }
+        } else {
             filtered.push(dataPoints[i]);
             cleanValues.push(dataPoints[i].y);
+            consecutiveRejects = 0;
         }
     }
 
@@ -720,7 +732,7 @@ function updateTodayPriceChart(data) {
             if (date) todayPoints.push({ x: date, y: convertPriceWithTaxes(d.price, selectedCurrency) });
         }
 
-        const filteredTodayPoints = filterSpikes(todayPoints, 3.0, 6);
+        const filteredTodayPoints = filterSpikes(todayPoints, 3.5, 6);
 
         datasets.push({
             label: `Today (${data.today_date})`,
@@ -743,7 +755,7 @@ function updateTodayPriceChart(data) {
             if (date) tomorrowPoints.push({ x: date, y: convertPriceWithTaxes(d.price, selectedCurrency) });
         }
 
-        const filteredTomorrowPoints = filterSpikes(tomorrowPoints, 3.0, 6);
+        const filteredTomorrowPoints = filterSpikes(tomorrowPoints, 3.5, 6);
 
         datasets.push({
             label: `Tomorrow (${data.tomorrow_date})`,
