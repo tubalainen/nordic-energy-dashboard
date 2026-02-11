@@ -544,71 +544,46 @@ def parse_value(value):
 
 
 # =============================================================================
-# SPIKE DETECTION (Rolling Median + MAD)
+# SPIKE DETECTION (Previous-Value Comparison)
 # =============================================================================
+# A spike is a sudden, dramatic change from the previous data point.
+# Energy production/consumption change gradually — a 50%+ jump in one reading
+# is almost certainly bad data, not a real event.
+# Price data from Nordpool is NOT filtered — those are valid market prices.
 
-SPIKE_WINDOW_SIZE = 24       # Number of recent data points to consider
-SPIKE_THRESHOLD_K = 4.0      # Multiplier for MAD-based threshold
-SPIKE_FALLBACK_PCT = 0.35    # 35% fallback when MAD = 0
-SPIKE_MIN_HISTORY = 6        # Minimum history points needed to validate
-
-
-def _compute_median(values):
-    """Return the median of a list of floats."""
-    s = sorted(values)
-    n = len(s)
-    if n == 0:
-        return 0.0
-    mid = n // 2
-    if n % 2 == 0:
-        return (s[mid - 1] + s[mid]) / 2.0
-    return s[mid]
+SPIKE_MAX_CHANGE_PCT = 0.50  # Max allowed change vs previous value (50%)
+SPIKE_MIN_BASELINE = 0.1     # Minimum baseline to avoid false positives near zero
 
 
-def _compute_mad(values, median):
-    """Return the Median Absolute Deviation."""
-    deviations = [abs(v - median) for v in values]
-    return _compute_median(deviations)
-
-
-def is_spike_value(new_value, recent_values, threshold_k=SPIKE_THRESHOLD_K,
-                   fallback_pct=SPIKE_FALLBACK_PCT, min_history=SPIKE_MIN_HISTORY):
-    """Determine if new_value is a spike relative to recent_values.
+def is_spike_value(new_value, previous_value, max_change_pct=SPIKE_MAX_CHANGE_PCT,
+                   min_baseline=SPIKE_MIN_BASELINE):
+    """Determine if new_value is a spike compared to the previous data point.
 
     Returns (is_spike: bool, reason: str).
-    - If insufficient history (< min_history), accept unconditionally.
-    - Compute rolling median + MAD. If MAD == 0, use percentage-based fallback.
-    - Reject if |new_value - median| > k * MAD (or > fallback_pct * |median|).
+    - If no previous value exists, accept unconditionally (first data point).
+    - Compare |new - prev| / max(|prev|, min_baseline) against max_change_pct.
     """
-    if len(recent_values) < min_history:
-        return False, "insufficient_history"
+    if previous_value is None:
+        return False, "no_previous_value"
 
-    median = _compute_median(recent_values)
-    mad = _compute_mad(recent_values, median)
-    deviation = abs(new_value - median)
+    change = abs(new_value - previous_value)
+    baseline = max(abs(previous_value), min_baseline)
+    pct = change / baseline
 
-    if mad > 0:
-        if deviation > threshold_k * mad:
-            return True, f"MAD_exceeded: deviation={deviation:.4f}, threshold={threshold_k * mad:.4f}"
-        return False, "within_MAD_bounds"
-    else:
-        # MAD is 0 -- all recent values are identical
-        if abs(median) < 1e-9:
-            if abs(new_value) > 0.01:
-                return True, f"zero_median_nonzero_value: {new_value}"
-            return False, "zero_median_zero_value"
-        if deviation > fallback_pct * abs(median):
-            return True, f"pct_exceeded: deviation={deviation:.4f}, threshold={fallback_pct * abs(median):.4f}"
-        return False, "within_pct_bounds"
+    if pct > max_change_pct:
+        return True, f"change={change:.4f}, baseline={baseline:.4f}, pct={pct:.2%}"
+    return False, "ok"
 
 
-def get_recent_values(cursor, table, column, country, limit=SPIKE_WINDOW_SIZE):
-    """Query the most recent N values of a column for a country."""
+def get_previous_value(cursor, table, column, country):
+    """Query the single most recent value of a column for a country."""
     # Table and column names are hardcoded application constants, not user input
-    query = f'SELECT {column} FROM {table} WHERE country = ? ORDER BY timestamp DESC LIMIT ?'
-    cursor.execute(query, (country, limit))
-    rows = cursor.fetchall()
-    return [row[0] for row in rows if row[0] is not None]
+    query = f'SELECT {column} FROM {table} WHERE country = ? ORDER BY timestamp DESC LIMIT 1'
+    cursor.execute(query, (country,))
+    row = cursor.fetchone()
+    if row and row[0] is not None:
+        return row[0]
+    return None
 
 
 STATNETT_API_RETRIES = 3
@@ -668,16 +643,15 @@ def fetch_and_store_data():
                     'export_value': export_val,
                 }
                 for field_name, field_val in status_fields.items():
-                    recent = get_recent_values(cursor, 'energy_status', field_name, country_code)
-                    spike, reason = is_spike_value(field_val, recent)
+                    prev = get_previous_value(cursor, 'energy_status', field_name, country_code)
+                    spike, reason = is_spike_value(field_val, prev)
                     if spike:
-                        median = _compute_median(recent)
                         logger.warning(
                             f"Spike detected in {field_name} for {country_code}: "
-                            f"value={field_val:.4f}, median={median:.4f}, reason={reason}. "
-                            f"Clamping to median."
+                            f"value={field_val:.4f}, previous={prev:.4f}, reason={reason}. "
+                            f"Clamping to previous value."
                         )
-                        status_fields[field_name] = median
+                        status_fields[field_name] = prev
 
                 cursor.execute('''
                     INSERT OR REPLACE INTO energy_status
@@ -707,16 +681,15 @@ def fetch_and_store_data():
                     'not_specified': not_specified / 1000,
                 }
                 for field_name, field_val in types_fields.items():
-                    recent = get_recent_values(cursor, 'energy_types', field_name, country_code)
-                    spike, reason = is_spike_value(field_val, recent)
+                    prev = get_previous_value(cursor, 'energy_types', field_name, country_code)
+                    spike, reason = is_spike_value(field_val, prev)
                     if spike:
-                        median = _compute_median(recent)
                         logger.warning(
                             f"Spike detected in {field_name} for {country_code}: "
-                            f"value={field_val:.4f}, median={median:.4f}, reason={reason}. "
-                            f"Clamping to median."
+                            f"value={field_val:.4f}, previous={prev:.4f}, reason={reason}. "
+                            f"Clamping to previous value."
                         )
-                        types_fields[field_name] = median
+                        types_fields[field_name] = prev
 
                 cursor.execute('''
                     INSERT OR REPLACE INTO energy_types
@@ -836,21 +809,6 @@ def fetch_and_store_prices():
             for timestamp, zone_code, price in all_results:
                 country = ZONE_TO_COUNTRY.get(zone_code)
                 if not country:
-                    continue
-
-                # Spike detection for prices (per zone)
-                cursor.execute(
-                    'SELECT price FROM spot_prices WHERE zone = ? ORDER BY timestamp DESC LIMIT ?',
-                    (zone_code, SPIKE_WINDOW_SIZE)
-                )
-                recent_prices = [r['price'] for r in cursor.fetchall() if r['price'] is not None]
-                spike, reason = is_spike_value(price, recent_prices)
-                if spike:
-                    med = _compute_median(recent_prices)
-                    logger.warning(
-                        f"Price spike detected for zone {zone_code} at {timestamp}: "
-                        f"value={price:.2f}, median={med:.2f}, reason={reason}. Skipping."
-                    )
                     continue
 
                 cursor.execute('''
