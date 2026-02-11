@@ -1,6 +1,6 @@
 /**
  * Nordic Energy Dashboard - Frontend Application
- * Version 11 - Spike filtering, Swedish taxes toggle
+ * Version 12 - Improved spike filtering (clean-window approach)
  */
 
 // =============================================================================
@@ -210,26 +210,26 @@ const debouncedLoadCorrelation = debounce(() => { loadCorrelationData(); }, 300)
 // SPIKE FILTERING (Frontend - Rolling Median + MAD)
 // =============================================================================
 
-function filterSpikes(dataPoints, thresholdK = 4.0, windowSize = 12, fallbackPct = 0.40) {
+function filterSpikes(dataPoints, thresholdK = 3.0, windowSize = 24, fallbackPct = 0.30) {
     /**
      * Filter spike values from an array of {x, y} points.
-     * Uses a sliding window with median + MAD to detect outliers.
-     * Returns a new array with spikes removed.
+     * Uses a clean-window approach: only accepted (non-spike) values are used
+     * for median + MAD computation, preventing consecutive spikes from
+     * contaminating the detection window.
      */
     if (!dataPoints || dataPoints.length < 4) return dataPoints;
 
-    const values = dataPoints.map(p => p.y);
     const filtered = [];
+    const cleanValues = [];
 
     for (let i = 0; i < dataPoints.length; i++) {
-        // Build window from preceding points (using original values to prevent cascade)
-        const windowStart = Math.max(0, i - windowSize);
-        const window = values.slice(windowStart, i);
-
-        if (window.length < 3) {
+        if (cleanValues.length < 3) {
             filtered.push(dataPoints[i]);
+            cleanValues.push(dataPoints[i].y);
             continue;
         }
+
+        const window = cleanValues.slice(-windowSize);
 
         const sorted = [...window].sort((a, b) => a - b);
         const mid = Math.floor(sorted.length / 2);
@@ -259,6 +259,7 @@ function filterSpikes(dataPoints, thresholdK = 4.0, windowSize = 12, fallbackPct
 
         if (!isSpike) {
             filtered.push(dataPoints[i]);
+            cleanValues.push(dataPoints[i].y);
         }
     }
 
@@ -719,7 +720,7 @@ function updateTodayPriceChart(data) {
             if (date) todayPoints.push({ x: date, y: convertPriceWithTaxes(d.price, selectedCurrency) });
         }
 
-        const filteredTodayPoints = filterSpikes(todayPoints, 4.0, 6);
+        const filteredTodayPoints = filterSpikes(todayPoints, 3.0, 6);
 
         datasets.push({
             label: `Today (${data.today_date})`,
@@ -742,7 +743,7 @@ function updateTodayPriceChart(data) {
             if (date) tomorrowPoints.push({ x: date, y: convertPriceWithTaxes(d.price, selectedCurrency) });
         }
 
-        const filteredTomorrowPoints = filterSpikes(tomorrowPoints, 4.0, 6);
+        const filteredTomorrowPoints = filterSpikes(tomorrowPoints, 3.0, 6);
 
         datasets.push({
             label: `Tomorrow (${data.tomorrow_date})`,
@@ -1226,7 +1227,7 @@ function updateScatterChart(corrData) {
     }
 
     const scatterPoints = corrData.data.map(d => ({ x: d.energy_value, y: convertPriceWithTaxes(d.price, selectedCurrency) }));
-    const filteredScatter = filterSpikes(scatterPoints, 5.0, 20);
+    const filteredScatter = filterSpikes(scatterPoints, 3.5, 24);
     const etLabel = typeLabels[corrData.energy_type] || corrData.energy_type;
     const etColor = typeColors[corrData.energy_type] || typeColors.wind;
 
