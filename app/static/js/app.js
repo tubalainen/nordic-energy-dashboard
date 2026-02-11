@@ -540,10 +540,10 @@ function getCurrencyLabel() {
 }
 
 function applySwedishTaxes(priceEurKwh) {
-    // Formula: (spot price * 1.25) + 0.001 EUR/kWh
+    // Formula: (spot price * 1.25) + 0.1 EUR/kWh
     // 1.25 = 25% Swedish VAT (moms)
-    // 0.001 EUR/kWh = 0.1 Eurocent/kWh energy tax
-    return (priceEurKwh * 1.25) + 0.001;
+    // 0.1 EUR/kWh energy tax
+    return (priceEurKwh * 1.25) + 0.1;
 }
 
 function isSwedishZone(zone) {
