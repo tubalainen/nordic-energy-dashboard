@@ -1,6 +1,6 @@
 /**
  * Nordic Energy Dashboard - Frontend Application
- * Version 10 - Today/tomorrow prices, currency selection, current spot price tile
+ * Version 11 - Spike filtering, Swedish taxes toggle
  */
 
 // =============================================================================
@@ -10,7 +10,8 @@
 const DEFAULT_SETTINGS = {
     defaultCountry: 'SE',
     defaultDays: 30,
-    defaultCurrency: 'SEK'
+    defaultCurrency: 'SEK',
+    swedishTaxesEnabled: false
 };
 
 function loadSettings() {
@@ -54,6 +55,9 @@ let selectedEnergyType = 'wind';
 // Currency & exchange rate state
 let selectedCurrency = settings.defaultCurrency || 'SEK';
 let exchangeRates = { EUR: 1.0, SEK: 11.0, DKK: 7.45, NOK: 11.5 };
+
+// Swedish taxes state
+let swedishTaxesEnabled = settings.swedishTaxesEnabled || false;
 
 // =============================================================================
 // COLOR SCHEMES
@@ -203,6 +207,65 @@ const debouncedLoadData = debounce(() => { loadData(); }, 300);
 const debouncedLoadCorrelation = debounce(() => { loadCorrelationData(); }, 300);
 
 // =============================================================================
+// SPIKE FILTERING (Frontend - Rolling Median + MAD)
+// =============================================================================
+
+function filterSpikes(dataPoints, thresholdK = 4.0, windowSize = 12, fallbackPct = 0.40) {
+    /**
+     * Filter spike values from an array of {x, y} points.
+     * Uses a sliding window with median + MAD to detect outliers.
+     * Returns a new array with spikes removed.
+     */
+    if (!dataPoints || dataPoints.length < 4) return dataPoints;
+
+    const values = dataPoints.map(p => p.y);
+    const filtered = [];
+
+    for (let i = 0; i < dataPoints.length; i++) {
+        // Build window from preceding points (using original values to prevent cascade)
+        const windowStart = Math.max(0, i - windowSize);
+        const window = values.slice(windowStart, i);
+
+        if (window.length < 3) {
+            filtered.push(dataPoints[i]);
+            continue;
+        }
+
+        const sorted = [...window].sort((a, b) => a - b);
+        const mid = Math.floor(sorted.length / 2);
+        const median = sorted.length % 2 === 0
+            ? (sorted[mid - 1] + sorted[mid]) / 2
+            : sorted[mid];
+
+        const deviations = sorted.map(v => Math.abs(v - median));
+        deviations.sort((a, b) => a - b);
+        const madMid = Math.floor(deviations.length / 2);
+        const mad = deviations.length % 2 === 0
+            ? (deviations[madMid - 1] + deviations[madMid]) / 2
+            : deviations[madMid];
+
+        const deviation = Math.abs(dataPoints[i].y - median);
+
+        let isSpike = false;
+        if (mad > 0) {
+            isSpike = deviation > thresholdK * mad;
+        } else {
+            if (Math.abs(median) > 1e-9) {
+                isSpike = deviation > fallbackPct * Math.abs(median);
+            } else {
+                isSpike = Math.abs(dataPoints[i].y) > 0.01;
+            }
+        }
+
+        if (!isSpike) {
+            filtered.push(dataPoints[i]);
+        }
+    }
+
+    return filtered;
+}
+
+// =============================================================================
 // INITIALIZATION
 // =============================================================================
 
@@ -215,6 +278,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initializeSettingsModal();
     initializeCorrelationControls();
     initializeCurrencySelector();
+    initializeSwedishTaxToggle();
     fetchExchangeRates().then(() => {
         loadData();
         loadStats();
@@ -408,6 +472,7 @@ function initializeCorrelationControls() {
 
     zoneSelector.addEventListener('change', (e) => {
         selectedZone = e.target.value;
+        updateSwedishTaxVisibility();
         loadCorrelationData();
         loadTodayPrices();
     });
@@ -441,6 +506,7 @@ async function updateZoneSelector() {
         }
 
         selectedZone = zoneSelector.value;
+        updateSwedishTaxVisibility();
     } catch (err) {
         console.error('Failed to load zones:', err);
     }
@@ -458,6 +524,27 @@ function convertPrice(priceEur, currency) {
 
 function getCurrencyLabel() {
     return `${selectedCurrency}/kWh`;
+}
+
+function applySwedishTaxes(priceEurKwh) {
+    // Formula: (spot price * 1.25) + 0.001 EUR/kWh
+    // 1.25 = 25% Swedish VAT (moms)
+    // 0.001 EUR/kWh = 0.1 Eurocent/kWh energy tax
+    return (priceEurKwh * 1.25) + 0.001;
+}
+
+function isSwedishZone(zone) {
+    if (!zone) return false;
+    return zone.startsWith('SE');
+}
+
+function convertPriceWithTaxes(priceEurKwh, currency, zone) {
+    let price = priceEurKwh;
+    const effectiveZone = zone || selectedZone;
+    if (swedishTaxesEnabled && isSwedishZone(effectiveZone)) {
+        price = applySwedishTaxes(price);
+    }
+    return convertPrice(price, currency);
 }
 
 async function fetchExchangeRates() {
@@ -488,6 +575,50 @@ function initializeCurrencySelector() {
         loadCorrelationData();
         loadTodayPrices();
     });
+}
+
+// =============================================================================
+// SWEDISH TAX TOGGLE
+// =============================================================================
+
+function initializeSwedishTaxToggle() {
+    const toggle = document.getElementById('swedishTaxToggle');
+    const group = document.getElementById('swedishTaxGroup');
+    if (!toggle || !group) return;
+
+    toggle.checked = swedishTaxesEnabled;
+    updateSwedishTaxVisibility();
+
+    toggle.addEventListener('change', (e) => {
+        swedishTaxesEnabled = e.target.checked;
+
+        // Save preference
+        const currentSettings = loadSettings();
+        currentSettings.swedishTaxesEnabled = swedishTaxesEnabled;
+        saveSettings(currentSettings);
+
+        // Re-render all price displays
+        refreshAllPriceDisplays();
+    });
+}
+
+function updateSwedishTaxVisibility() {
+    const group = document.getElementById('swedishTaxGroup');
+    if (!group) return;
+
+    if (isSwedishZone(selectedZone)) {
+        group.style.display = '';
+    } else {
+        group.style.display = 'none';
+    }
+}
+
+function refreshAllPriceDisplays() {
+    if (currentData && Object.keys(currentData).length > 0) {
+        renderCurrentValues(currentData);
+    }
+    loadCorrelationData();
+    loadTodayPrices();
 }
 
 // =============================================================================
@@ -585,12 +716,14 @@ function updateTodayPriceChart(data) {
         const todayPoints = [];
         for (const d of data.today) {
             const date = parseTimestamp(d.timestamp);
-            if (date) todayPoints.push({ x: date, y: convertPrice(d.price, selectedCurrency) });
+            if (date) todayPoints.push({ x: date, y: convertPriceWithTaxes(d.price, selectedCurrency) });
         }
+
+        const filteredTodayPoints = filterSpikes(todayPoints, 4.0, 6);
 
         datasets.push({
             label: `Today (${data.today_date})`,
-            data: todayPoints,
+            data: filteredTodayPoints,
             borderColor: priceColor.border,
             backgroundColor: priceColor.background,
             borderWidth: 2,
@@ -606,12 +739,14 @@ function updateTodayPriceChart(data) {
         const tomorrowPoints = [];
         for (const d of data.tomorrow) {
             const date = parseTimestamp(d.timestamp);
-            if (date) tomorrowPoints.push({ x: date, y: convertPrice(d.price, selectedCurrency) });
+            if (date) tomorrowPoints.push({ x: date, y: convertPriceWithTaxes(d.price, selectedCurrency) });
         }
+
+        const filteredTomorrowPoints = filterSpikes(tomorrowPoints, 4.0, 6);
 
         datasets.push({
             label: `Tomorrow (${data.tomorrow_date})`,
-            data: tomorrowPoints,
+            data: filteredTomorrowPoints,
             borderColor: tomorrowPriceColor.border,
             backgroundColor: tomorrowPriceColor.background,
             borderWidth: 2,
@@ -632,7 +767,8 @@ function updateTodayPriceChart(data) {
     };
     todayPriceChart.update('none');
 
-    const subtitle = `${data.zone} | ${data.country_name} | ${getCurrencyLabel()}`;
+    const taxLabel = (swedishTaxesEnabled && isSwedishZone(data.zone)) ? ' (incl. tax)' : '';
+    const subtitle = `${data.zone} | ${data.country_name} | ${getCurrencyLabel()}${taxLabel}`;
     const subtitleEl = document.getElementById('todayPriceChartSubtitle');
     if (subtitleEl) {
         subtitleEl.textContent = subtitle + (data.has_tomorrow ? '' : ' | Tomorrow not yet available');
@@ -646,9 +782,9 @@ function updateCurrentSpotPriceTile(data) {
     const timeEl = document.getElementById('spotPriceTime');
 
     if (data.current_price) {
-        const converted = convertPrice(data.current_price.price, selectedCurrency);
+        const converted = convertPriceWithTaxes(data.current_price.price, selectedCurrency);
         valueEl.textContent = converted.toFixed(2);
-        unitEl.textContent = getCurrencyLabel();
+        unitEl.textContent = getCurrencyLabel() + ((swedishTaxesEnabled && isSwedishZone(data.zone)) ? ' (incl. tax)' : '');
         zoneEl.textContent = data.zone;
 
         if (data.current_price.timestamp) {
@@ -803,13 +939,19 @@ async function loadData() {
                             }
                         }
 
-                        const pointRadius = productionData.length < 10 ? 6 : productionData.length < 50 ? 4 : 2;
+                        // Filter spikes from status data
+                        const filteredProduction = filterSpikes(productionData);
+                        const filteredConsumption = filterSpikes(consumptionData);
+                        const filteredImport = filterSpikes(importData);
+                        const filteredExport = filterSpikes(exportData);
+
+                        const pointRadius = filteredProduction.length < 10 ? 6 : filteredProduction.length < 50 ? 4 : 2;
                         const baseProps = { borderWidth: 2, borderDash: countryStyle.lineStyle, tension: 0.3, pointRadius, pointHoverRadius: pointRadius + 2, country };
 
-                        statusDatasets.push({ label: `${countryName} - Production`, data: productionData, borderColor: statusColors.production.border, backgroundColor: statusColors.production.background, ...baseProps, metricType: 'production' });
-                        statusDatasets.push({ label: `${countryName} - Consumption`, data: consumptionData, borderColor: statusColors.consumption.border, backgroundColor: statusColors.consumption.background, ...baseProps, metricType: 'consumption' });
-                        statusDatasets.push({ label: `${countryName} - Import`, data: importData, borderColor: statusColors.import.border, backgroundColor: statusColors.import.background, ...baseProps, metricType: 'import' });
-                        statusDatasets.push({ label: `${countryName} - Export`, data: exportData, borderColor: statusColors.export.border, backgroundColor: statusColors.export.background, ...baseProps, metricType: 'export' });
+                        statusDatasets.push({ label: `${countryName} - Production`, data: filteredProduction, borderColor: statusColors.production.border, backgroundColor: statusColors.production.background, ...baseProps, metricType: 'production' });
+                        statusDatasets.push({ label: `${countryName} - Consumption`, data: filteredConsumption, borderColor: statusColors.consumption.border, backgroundColor: statusColors.consumption.background, ...baseProps, metricType: 'consumption' });
+                        statusDatasets.push({ label: `${countryName} - Import`, data: filteredImport, borderColor: statusColors.import.border, backgroundColor: statusColors.import.background, ...baseProps, metricType: 'import' });
+                        statusDatasets.push({ label: `${countryName} - Export`, data: filteredExport, borderColor: statusColors.export.border, backgroundColor: statusColors.export.background, ...baseProps, metricType: 'export' });
                     }
                 } catch (err) {
                     console.error(`Error processing status for ${country}:`, err);
@@ -835,14 +977,21 @@ async function loadData() {
                             }
                         }
 
-                        const pointRadius = nuclearData.length < 10 ? 6 : nuclearData.length < 50 ? 4 : 2;
+                        // Filter spikes from types data
+                        const filteredNuclear = filterSpikes(nuclearData);
+                        const filteredHydro = filterSpikes(hydroData);
+                        const filteredWind = filterSpikes(windData);
+                        const filteredThermal = filterSpikes(thermalData);
+                        const filteredOther = filterSpikes(otherData);
+
+                        const pointRadius = filteredNuclear.length < 10 ? 6 : filteredNuclear.length < 50 ? 4 : 2;
                         const baseProps = { borderWidth: 2, borderDash: countryStyle.lineStyle, tension: 0.3, pointRadius, pointHoverRadius: pointRadius + 2, country };
 
-                        typesDatasets.push({ label: `${countryName} - Nuclear`, data: nuclearData, borderColor: typeColors.nuclear.border, backgroundColor: typeColors.nuclear.background, ...baseProps, metricType: 'nuclear' });
-                        typesDatasets.push({ label: `${countryName} - Hydro`, data: hydroData, borderColor: typeColors.hydro.border, backgroundColor: typeColors.hydro.background, ...baseProps, metricType: 'hydro' });
-                        typesDatasets.push({ label: `${countryName} - Wind`, data: windData, borderColor: typeColors.wind.border, backgroundColor: typeColors.wind.background, ...baseProps, metricType: 'wind' });
-                        typesDatasets.push({ label: `${countryName} - Thermal`, data: thermalData, borderColor: typeColors.thermal.border, backgroundColor: typeColors.thermal.background, ...baseProps, metricType: 'thermal' });
-                        typesDatasets.push({ label: `${countryName} - Other`, data: otherData, borderColor: typeColors.not_specified.border, backgroundColor: typeColors.not_specified.background, ...baseProps, metricType: 'not_specified' });
+                        typesDatasets.push({ label: `${countryName} - Nuclear`, data: filteredNuclear, borderColor: typeColors.nuclear.border, backgroundColor: typeColors.nuclear.background, ...baseProps, metricType: 'nuclear' });
+                        typesDatasets.push({ label: `${countryName} - Hydro`, data: filteredHydro, borderColor: typeColors.hydro.border, backgroundColor: typeColors.hydro.background, ...baseProps, metricType: 'hydro' });
+                        typesDatasets.push({ label: `${countryName} - Wind`, data: filteredWind, borderColor: typeColors.wind.border, backgroundColor: typeColors.wind.background, ...baseProps, metricType: 'wind' });
+                        typesDatasets.push({ label: `${countryName} - Thermal`, data: filteredThermal, borderColor: typeColors.thermal.border, backgroundColor: typeColors.thermal.background, ...baseProps, metricType: 'thermal' });
+                        typesDatasets.push({ label: `${countryName} - Other`, data: filteredOther, borderColor: typeColors.not_specified.border, backgroundColor: typeColors.not_specified.background, ...baseProps, metricType: 'not_specified' });
                     }
                 } catch (err) {
                     console.error(`Error processing types for ${country}:`, err);
@@ -958,14 +1107,15 @@ function updatePriceChart(priceData) {
     const pointData = [];
     for (const d of priceData.data) {
         const date = parseTimestamp(d.timestamp);
-        if (date) pointData.push({ x: date, y: convertPrice(d.price, selectedCurrency) });
+        if (date) pointData.push({ x: date, y: convertPriceWithTaxes(d.price, selectedCurrency) });
     }
 
-    const pointRadius = pointData.length < 10 ? 6 : pointData.length < 50 ? 3 : 1;
+    const filteredPointData = filterSpikes(pointData);
+    const pointRadius = filteredPointData.length < 10 ? 6 : filteredPointData.length < 50 ? 3 : 1;
 
     priceChart.data.datasets = [{
         label: `Spot Price (${priceData.zone || 'avg'})`,
-        data: pointData,
+        data: filteredPointData,
         borderColor: priceColor.border,
         backgroundColor: priceColor.background,
         borderWidth: 2,
@@ -985,7 +1135,8 @@ function updatePriceChart(priceData) {
     };
     priceChart.update('none');
 
-    const subtitle = `${priceData.zone || 'avg'} | ${priceData.country_name} | ${getCurrencyLabel()}`;
+    const taxLabel = (swedishTaxesEnabled && isSwedishZone(priceData.zone)) ? ' (incl. tax)' : '';
+    const subtitle = `${priceData.zone || 'avg'} | ${priceData.country_name} | ${getCurrencyLabel()}${taxLabel}`;
     document.getElementById('priceChartSubtitle').textContent = subtitle;
 }
 
@@ -1003,18 +1154,34 @@ function updateCorrelationChart(corrData) {
         const date = parseTimestamp(d.timestamp);
         if (date) {
             energyPoints.push({ x: date, y: d.energy_value });
-            pricePoints.push({ x: date, y: convertPrice(d.price, selectedCurrency) });
+            pricePoints.push({ x: date, y: convertPriceWithTaxes(d.price, selectedCurrency) });
+        }
+    }
+
+    // Filter spikes from both series, keeping them aligned
+    const filteredEnergy = filterSpikes(energyPoints);
+    const filteredEnergyTimes = new Set(filteredEnergy.map(p => p.x.getTime()));
+    const filteredPrice = filterSpikes(pricePoints);
+    const filteredPriceTimes = new Set(filteredPrice.map(p => p.x.getTime()));
+
+    const alignedEnergy = [];
+    const alignedPrice = [];
+    for (let i = 0; i < energyPoints.length; i++) {
+        const t = energyPoints[i].x.getTime();
+        if (filteredEnergyTimes.has(t) && filteredPriceTimes.has(t)) {
+            alignedEnergy.push(energyPoints[i]);
+            alignedPrice.push(pricePoints[i]);
         }
     }
 
     const etLabel = typeLabels[corrData.energy_type] || corrData.energy_type;
     const etColor = typeColors[corrData.energy_type] || typeColors.wind;
-    const pointRadius = energyPoints.length < 50 ? 3 : 1;
+    const pointRadius = alignedEnergy.length < 50 ? 3 : 1;
 
     correlationChart.data.datasets = [
         {
             label: `${etLabel} (GW)`,
-            data: energyPoints,
+            data: alignedEnergy,
             borderColor: etColor.border,
             backgroundColor: 'transparent',
             borderWidth: 2,
@@ -1024,7 +1191,7 @@ function updateCorrelationChart(corrData) {
         },
         {
             label: `Spot Price (${getCurrencyLabel()})`,
-            data: pricePoints,
+            data: alignedPrice,
             borderColor: priceColor.border,
             backgroundColor: 'transparent',
             borderWidth: 2,
@@ -1058,14 +1225,15 @@ function updateScatterChart(corrData) {
         return;
     }
 
-    const scatterPoints = corrData.data.map(d => ({ x: d.energy_value, y: convertPrice(d.price, selectedCurrency) }));
+    const scatterPoints = corrData.data.map(d => ({ x: d.energy_value, y: convertPriceWithTaxes(d.price, selectedCurrency) }));
+    const filteredScatter = filterSpikes(scatterPoints, 5.0, 20);
     const etLabel = typeLabels[corrData.energy_type] || corrData.energy_type;
     const etColor = typeColors[corrData.energy_type] || typeColors.wind;
 
     // Calculate trend line (linear regression)
     const datasets = [{
         label: `${etLabel} vs Price`,
-        data: scatterPoints,
+        data: filteredScatter,
         backgroundColor: etColor.background.replace('0.8', '0.5'),
         borderColor: etColor.border,
         pointRadius: 3,
@@ -1073,9 +1241,9 @@ function updateScatterChart(corrData) {
     }];
 
     // Add trend line if enough data
-    if (scatterPoints.length >= 3) {
-        const { slope, intercept } = linearRegression(scatterPoints);
-        const xValues = scatterPoints.map(p => p.x);
+    if (filteredScatter.length >= 3) {
+        const { slope, intercept } = linearRegression(filteredScatter);
+        const xValues = filteredScatter.map(p => p.x);
         const xMin = Math.min(...xValues);
         const xMax = Math.max(...xValues);
         datasets.push({
@@ -1190,7 +1358,7 @@ function renderCurrentValues(data) {
         const priceHtml = countryData.price
             ? `<div class="value-item value-item-full">
                     <span class="value-label">Spot Price (${countryData.price.zone})</span>
-                    <span class="value-number price">${convertPrice(countryData.price.value, selectedCurrency)?.toFixed(2) || '--'} ${getCurrencyLabel()}</span>
+                    <span class="value-number price">${convertPriceWithTaxes(countryData.price.value, selectedCurrency, countryData.price.zone)?.toFixed(2) || '--'} ${getCurrencyLabel()}</span>
                </div>`
             : '';
 
@@ -1336,4 +1504,4 @@ setInterval(() => {
     loadStats();
 }, 5 * 60 * 1000);
 
-console.log('Nordic Energy Dashboard v10 loaded (today/tomorrow prices, currency selection)');
+console.log('Nordic Energy Dashboard v11 loaded (spike filtering, Swedish taxes toggle)');

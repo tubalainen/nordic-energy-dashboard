@@ -929,6 +929,63 @@ body {
     min-width: 160px;
 }
 
+/* Swedish Tax Toggle Switch */
+.toggle-switch {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    cursor: pointer;
+    padding: 0.6rem 0;
+    user-select: none;
+}
+
+.toggle-switch input {
+    display: none;
+}
+
+.toggle-slider {
+    position: relative;
+    width: 44px;
+    height: 24px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    transition: var(--transition);
+    flex-shrink: 0;
+}
+
+.toggle-slider::after {
+    content: '';
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 18px;
+    height: 18px;
+    background: var(--text-secondary);
+    border-radius: 50%;
+    transition: var(--transition);
+}
+
+.toggle-switch input:checked + .toggle-slider {
+    background: var(--accent-blue);
+    border-color: var(--accent-blue);
+}
+
+.toggle-switch input:checked + .toggle-slider::after {
+    transform: translateX(20px);
+    background: white;
+}
+
+.toggle-label {
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+    font-weight: 500;
+}
+
+.toggle-switch input:checked ~ .toggle-label {
+    color: var(--text-primary);
+}
+
 /* Correlation Summary Cards */
 .correlation-summary {
     display: grid;
@@ -1210,6 +1267,10 @@ body {
     .correlation-controls {
         flex-direction: column;
         gap: 1rem;
+    }
+
+    #swedishTaxGroup {
+        width: 100%;
     }
 
     .correlation-summary {
