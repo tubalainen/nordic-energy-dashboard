@@ -1,6 +1,6 @@
 /**
  * Nordic Energy Dashboard - Frontend Application
- * Version 12 - Improved spike filtering (clean-window approach)
+ * Version 13 - Rewritten spike filter (previous-value comparison)
  */
 
 // =============================================================================
@@ -210,69 +210,28 @@ const debouncedLoadCorrelation = debounce(() => { loadCorrelationData(); }, 300)
 // SPIKE FILTERING (Frontend - Rolling Median + MAD)
 // =============================================================================
 
-function filterSpikes(dataPoints, thresholdK = 3.5, windowSize = 24, fallbackPct = 0.35) {
+function filterSpikes(dataPoints, maxChangePct = 0.50, minBaseline = 0.1) {
     /**
      * Filter spike values from an array of {x, y} points.
-     * Uses a clean-window approach with a consecutive-rejection safety valve:
-     * only accepted values feed the window, but if more than maxConsecutiveRejects
-     * points are rejected in a row, we treat it as a legitimate level shift
-     * and accept the value (resetting the window).
+     * Compares each point to the previous accepted point. If the value changes
+     * by more than maxChangePct (50%) relative to the previous value, it's a spike.
+     * This catches sudden drops/jumps (e.g., 23 GW → 0 GW) while allowing
+     * gradual natural changes in the data.
      */
-    if (!dataPoints || dataPoints.length < 4) return dataPoints;
+    if (!dataPoints || dataPoints.length < 2) return dataPoints;
 
-    const filtered = [];
-    const cleanValues = [];
-    const maxConsecutiveRejects = 3;
-    let consecutiveRejects = 0;
+    const filtered = [dataPoints[0]];
 
-    for (let i = 0; i < dataPoints.length; i++) {
-        if (cleanValues.length < 3) {
-            filtered.push(dataPoints[i]);
-            cleanValues.push(dataPoints[i].y);
-            continue;
+    for (let i = 1; i < dataPoints.length; i++) {
+        const prev = filtered[filtered.length - 1].y;
+        const curr = dataPoints[i].y;
+        const change = Math.abs(curr - prev);
+        const baseline = Math.max(Math.abs(prev), minBaseline);
+
+        if (change / baseline > maxChangePct) {
+            continue; // Skip spike
         }
-
-        const win = cleanValues.slice(-windowSize);
-
-        const sorted = [...win].sort((a, b) => a - b);
-        const mid = Math.floor(sorted.length / 2);
-        const median = sorted.length % 2 === 0
-            ? (sorted[mid - 1] + sorted[mid]) / 2
-            : sorted[mid];
-
-        const deviations = sorted.map(v => Math.abs(v - median));
-        deviations.sort((a, b) => a - b);
-        const madMid = Math.floor(deviations.length / 2);
-        const mad = deviations.length % 2 === 0
-            ? (deviations[madMid - 1] + deviations[madMid]) / 2
-            : deviations[madMid];
-
-        const deviation = Math.abs(dataPoints[i].y - median);
-
-        let isSpike = false;
-        if (mad > 0) {
-            isSpike = deviation > thresholdK * mad;
-        } else {
-            if (Math.abs(median) > 1e-9) {
-                isSpike = deviation > fallbackPct * Math.abs(median);
-            } else {
-                isSpike = Math.abs(dataPoints[i].y) > 0.01;
-            }
-        }
-
-        if (isSpike) {
-            consecutiveRejects++;
-            // Safety valve: if too many consecutive rejects, this is a level shift
-            if (consecutiveRejects > maxConsecutiveRejects) {
-                filtered.push(dataPoints[i]);
-                cleanValues.push(dataPoints[i].y);
-                consecutiveRejects = 0;
-            }
-        } else {
-            filtered.push(dataPoints[i]);
-            cleanValues.push(dataPoints[i].y);
-            consecutiveRejects = 0;
-        }
+        filtered.push(dataPoints[i]);
     }
 
     return filtered;
@@ -732,11 +691,9 @@ function updateTodayPriceChart(data) {
             if (date) todayPoints.push({ x: date, y: convertPriceWithTaxes(d.price, selectedCurrency) });
         }
 
-        const filteredTodayPoints = filterSpikes(todayPoints, 3.5, 6);
-
         datasets.push({
             label: `Today (${data.today_date})`,
-            data: filteredTodayPoints,
+            data: todayPoints,
             borderColor: priceColor.border,
             backgroundColor: priceColor.background,
             borderWidth: 2,
@@ -755,11 +712,9 @@ function updateTodayPriceChart(data) {
             if (date) tomorrowPoints.push({ x: date, y: convertPriceWithTaxes(d.price, selectedCurrency) });
         }
 
-        const filteredTomorrowPoints = filterSpikes(tomorrowPoints, 3.5, 6);
-
         datasets.push({
             label: `Tomorrow (${data.tomorrow_date})`,
-            data: filteredTomorrowPoints,
+            data: tomorrowPoints,
             borderColor: tomorrowPriceColor.border,
             backgroundColor: tomorrowPriceColor.background,
             borderWidth: 2,
@@ -1123,12 +1078,11 @@ function updatePriceChart(priceData) {
         if (date) pointData.push({ x: date, y: convertPriceWithTaxes(d.price, selectedCurrency) });
     }
 
-    const filteredPointData = filterSpikes(pointData);
-    const pointRadius = filteredPointData.length < 10 ? 6 : filteredPointData.length < 50 ? 3 : 1;
+    const pointRadius = pointData.length < 10 ? 6 : pointData.length < 50 ? 3 : 1;
 
     priceChart.data.datasets = [{
         label: `Spot Price (${priceData.zone || 'avg'})`,
-        data: filteredPointData,
+        data: pointData,
         borderColor: priceColor.border,
         backgroundColor: priceColor.background,
         borderWidth: 2,
@@ -1171,30 +1125,14 @@ function updateCorrelationChart(corrData) {
         }
     }
 
-    // Filter spikes from both series, keeping them aligned
-    const filteredEnergy = filterSpikes(energyPoints);
-    const filteredEnergyTimes = new Set(filteredEnergy.map(p => p.x.getTime()));
-    const filteredPrice = filterSpikes(pricePoints);
-    const filteredPriceTimes = new Set(filteredPrice.map(p => p.x.getTime()));
-
-    const alignedEnergy = [];
-    const alignedPrice = [];
-    for (let i = 0; i < energyPoints.length; i++) {
-        const t = energyPoints[i].x.getTime();
-        if (filteredEnergyTimes.has(t) && filteredPriceTimes.has(t)) {
-            alignedEnergy.push(energyPoints[i]);
-            alignedPrice.push(pricePoints[i]);
-        }
-    }
-
     const etLabel = typeLabels[corrData.energy_type] || corrData.energy_type;
     const etColor = typeColors[corrData.energy_type] || typeColors.wind;
-    const pointRadius = alignedEnergy.length < 50 ? 3 : 1;
+    const pointRadius = energyPoints.length < 50 ? 3 : 1;
 
     correlationChart.data.datasets = [
         {
             label: `${etLabel} (GW)`,
-            data: alignedEnergy,
+            data: energyPoints,
             borderColor: etColor.border,
             backgroundColor: 'transparent',
             borderWidth: 2,
@@ -1204,7 +1142,7 @@ function updateCorrelationChart(corrData) {
         },
         {
             label: `Spot Price (${getCurrencyLabel()})`,
-            data: alignedPrice,
+            data: pricePoints,
             borderColor: priceColor.border,
             backgroundColor: 'transparent',
             borderWidth: 2,
@@ -1239,7 +1177,7 @@ function updateScatterChart(corrData) {
     }
 
     const scatterPoints = corrData.data.map(d => ({ x: d.energy_value, y: convertPriceWithTaxes(d.price, selectedCurrency) }));
-    const filteredScatter = filterSpikes(scatterPoints, 3.5, 24);
+    const filteredScatter = scatterPoints;
     const etLabel = typeLabels[corrData.energy_type] || corrData.energy_type;
     const etColor = typeColors[corrData.energy_type] || typeColors.wind;
 
