@@ -548,8 +548,8 @@ def parse_value(value):
 # =============================================================================
 
 SPIKE_WINDOW_SIZE = 24       # Number of recent data points to consider
-SPIKE_THRESHOLD_K = 5.0      # Multiplier for MAD-based threshold
-SPIKE_FALLBACK_PCT = 0.50    # 50% fallback when MAD = 0
+SPIKE_THRESHOLD_K = 4.0      # Multiplier for MAD-based threshold
+SPIKE_FALLBACK_PCT = 0.35    # 35% fallback when MAD = 0
 SPIKE_MIN_HISTORY = 6        # Minimum history points needed to validate
 
 
