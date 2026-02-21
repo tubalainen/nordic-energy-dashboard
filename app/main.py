@@ -33,6 +33,12 @@ FETCH_INTERVAL_MINUTES = int(os.environ.get('FETCH_INTERVAL', 5))
 DATA_RETENTION_DAYS = int(os.environ.get('DATA_RETENTION_DAYS', 200))
 LOG_LEVEL = os.environ.get('LOG_LEVEL', 'WARNING').upper()
 
+# Spike filter (applied to Statnett energy data at write time)
+SPIKE_WINDOW        = int(os.environ.get('SPIKE_WINDOW', 12))       # rolling window size (~1 hour at 5-min fetch)
+SPIKE_THRESHOLD     = float(os.environ.get('SPIKE_THRESHOLD', 3.0)) # sigma multiplier for std-based detection
+SPIKE_MIN_WINDOW    = int(os.environ.get('SPIKE_MIN_WINDOW', 6))    # min readings before filtering activates
+SPIKE_REL_THRESHOLD = float(os.environ.get('SPIKE_REL_THRESHOLD', 0.5))  # % deviation threshold when std=0
+
 # Security settings
 ENABLE_DEBUG_ENDPOINTS = os.environ.get('ENABLE_DEBUG_ENDPOINTS', 'false').lower() == 'true'
 RATE_LIMIT_DEFAULT = os.environ.get('RATE_LIMIT_DEFAULT', '100 per minute')
@@ -319,6 +325,50 @@ def interpret_correlation(r):
 
 
 # =============================================================================
+# SPIKE FILTER
+# =============================================================================
+
+def get_recent_values(conn, table, column, country, n):
+    """Return up to n most-recent non-NULL stored values for a column/country pair.
+
+    Uses an already-open connection so it participates in the caller's transaction.
+    table and column are always string literals from fetch_and_store_data — never
+    from user input — so the f-string interpolation is safe here.
+    """
+    cursor = conn.cursor()
+    cursor.execute(
+        f'SELECT {column} FROM {table} '
+        f'WHERE country = ? AND {column} IS NOT NULL '
+        f'ORDER BY timestamp DESC LIMIT ?',
+        (country, n)
+    )
+    return [float(row[0]) for row in cursor.fetchall()]
+
+
+def is_spike(new_val, recent_vals, threshold, rel_threshold):
+    """Return True if new_val is a statistical outlier relative to recent_vals.
+
+    Two-mode detection:
+      std > 0  →  sigma-based:    flag if abs(new - mean) > threshold * std
+      std == 0 and mean > 0  →  percentage-based: flag if |deviation| / mean > rel_threshold
+      std == 0 and mean == 0  →  accept (zero baseline, cannot determine)
+    """
+    n = len(recent_vals)
+    mean = sum(recent_vals) / n
+    variance = sum((v - mean) ** 2 for v in recent_vals) / n
+    std = math.sqrt(variance)
+
+    if std > 0.0:
+        return abs(new_val - mean) > threshold * std
+
+    # Constant baseline fallback: use relative deviation
+    if mean > 0.0:
+        return abs(new_val - mean) / mean > rel_threshold
+
+    return False  # Zero baseline — cannot classify, accept
+
+
+# =============================================================================
 # DATABASE
 # =============================================================================
 
@@ -531,22 +581,26 @@ def get_item(collection, key, target):
 
 
 def parse_value(value):
+    """Safely parse a numeric value. Returns None if missing or invalid."""
     if value is None:
-        return 0.0
+        return None
     if isinstance(value, (int, float)):
-        return float(value)
+        return None if value != value else float(value)   # NaN → None
     try:
         cleaned = str(value).encode('ascii', 'ignore').decode('ascii').strip()
-        return float(cleaned) if cleaned else 0.0
+        if not cleaned:
+            return None
+        result = float(cleaned)
+        return None if result != result else result        # NaN after conversion → None
     except (ValueError, AttributeError):
-        return 0.0
+        return None
 
 
 STATNETT_API_RETRIES = 3
 
 
 def fetch_and_store_data():
-    """Fetch data from Statnett API"""
+    """Fetch data from Statnett API and store, discarding statistical spikes."""
     global last_fetch_time, last_fetch_status
 
     logger.info("Fetching data from Statnett API...")
@@ -575,46 +629,121 @@ def fetch_and_store_data():
             cursor = conn.cursor()
 
             for country_code in COUNTRIES.keys():
-                consumption = parse_value(
-                    get_item(data.get("ConsumptionData", []), "titleTranslationId",
-                            f"ProductionConsumption.Consumption{country_code}Desc").get("value")
-                )
-                production = parse_value(
+
+                # ── energy_status ─────────────────────────────────────────────
+                production_raw = parse_value(
                     get_item(data.get("ProductionData", []), "titleTranslationId",
-                            f"ProductionConsumption.Production{country_code}Desc").get("value")
+                             f"ProductionConsumption.Production{country_code}Desc").get("value")
                 )
-                exchange = parse_value(
+                consumption_raw = parse_value(
+                    get_item(data.get("ConsumptionData", []), "titleTranslationId",
+                             f"ProductionConsumption.Consumption{country_code}Desc").get("value")
+                )
+                exchange_raw = parse_value(
                     get_item(data.get("NetExchangeData", []), "titleTranslationId",
-                            f"ProductionConsumption.NetExchange{country_code}Desc").get("value")
+                             f"ProductionConsumption.NetExchange{country_code}Desc").get("value")
                 )
 
-                import_val = exchange / 1000 if exchange >= 0 else 0
-                export_val = abs(exchange) / 1000 if exchange < 0 else 0
+                if production_raw is None and consumption_raw is None and exchange_raw is None:
+                    logger.warning(
+                        f"All energy_status fields None for {country_code} at {timestamp}, skipping row"
+                    )
+                else:
+                    # Scale to GW (matching stored units) before spike comparison
+                    production  = production_raw  / 1000.0 if production_raw  is not None else None
+                    consumption = consumption_raw / 1000.0 if consumption_raw is not None else None
+                    if exchange_raw is not None:
+                        ex = exchange_raw / 1000.0
+                        import_val = ex       if ex >= 0 else 0.0
+                        export_val = abs(ex)  if ex <  0 else 0.0
+                    else:
+                        import_val = None
+                        export_val = None
 
-                cursor.execute('''
-                    INSERT OR REPLACE INTO energy_status
-                    (timestamp, country, production, consumption, import_value, export_value)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                ''', (timestamp, country_code, production / 1000, consumption / 1000,
-                      import_val, export_val))
+                    def _check_status(col, val):
+                        if val is None:
+                            return None
+                        recent = get_recent_values(conn, 'energy_status', col, country_code, SPIKE_WINDOW)
+                        if len(recent) < SPIKE_MIN_WINDOW:
+                            return val
+                        if is_spike(val, recent, SPIKE_THRESHOLD, SPIKE_REL_THRESHOLD):
+                            logger.warning(
+                                f"Spike discarded: energy_status.{col}={val:.3f} GW "
+                                f"for {country_code} (window mean={sum(recent)/len(recent):.3f} GW)"
+                            )
+                            return None
+                        return val
 
-                nuclear = parse_value(get_item(data.get("NuclearData", []), "titleTranslationId",
-                            f"ProductionConsumption.Nuclear{country_code}Desc").get("value"))
-                hydro = parse_value(get_item(data.get("HydroData", []), "titleTranslationId",
-                            f"ProductionConsumption.Hydro{country_code}Desc").get("value"))
-                wind = parse_value(get_item(data.get("WindData", []), "titleTranslationId",
-                            f"ProductionConsumption.Wind{country_code}Desc").get("value"))
-                thermal = parse_value(get_item(data.get("ThermalData", []), "titleTranslationId",
-                            f"ProductionConsumption.Thermal{country_code}Desc").get("value"))
-                not_specified = parse_value(get_item(data.get("NotSpecifiedData", []), "titleTranslationId",
-                            f"ProductionConsumption.NotSpecified{country_code}Desc").get("value"))
+                    production  = _check_status('production',   production)
+                    consumption = _check_status('consumption',  consumption)
+                    import_val  = _check_status('import_value', import_val)
+                    export_val  = _check_status('export_value', export_val)
 
-                cursor.execute('''
-                    INSERT OR REPLACE INTO energy_types
-                    (timestamp, country, nuclear, hydro, wind, thermal, not_specified)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                ''', (timestamp, country_code, nuclear / 1000, hydro / 1000,
-                      wind / 1000, thermal / 1000, not_specified / 1000))
+                    cursor.execute('''
+                        INSERT OR REPLACE INTO energy_status
+                        (timestamp, country, production, consumption, import_value, export_value)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    ''', (timestamp, country_code, production, consumption, import_val, export_val))
+
+                # ── energy_types ──────────────────────────────────────────────
+                nuclear_raw = parse_value(
+                    get_item(data.get("NuclearData", []), "titleTranslationId",
+                             f"ProductionConsumption.Nuclear{country_code}Desc").get("value")
+                )
+                hydro_raw = parse_value(
+                    get_item(data.get("HydroData", []), "titleTranslationId",
+                             f"ProductionConsumption.Hydro{country_code}Desc").get("value")
+                )
+                wind_raw = parse_value(
+                    get_item(data.get("WindData", []), "titleTranslationId",
+                             f"ProductionConsumption.Wind{country_code}Desc").get("value")
+                )
+                thermal_raw = parse_value(
+                    get_item(data.get("ThermalData", []), "titleTranslationId",
+                             f"ProductionConsumption.Thermal{country_code}Desc").get("value")
+                )
+                not_specified_raw = parse_value(
+                    get_item(data.get("NotSpecifiedData", []), "titleTranslationId",
+                             f"ProductionConsumption.NotSpecified{country_code}Desc").get("value")
+                )
+
+                if all(v is None for v in [nuclear_raw, hydro_raw, wind_raw, thermal_raw, not_specified_raw]):
+                    logger.warning(
+                        f"All energy_types fields None for {country_code} at {timestamp}, skipping row"
+                    )
+                else:
+                    # Scale to GW before spike comparison
+                    nuclear       = nuclear_raw       / 1000.0 if nuclear_raw       is not None else None
+                    hydro         = hydro_raw         / 1000.0 if hydro_raw         is not None else None
+                    wind          = wind_raw          / 1000.0 if wind_raw          is not None else None
+                    thermal       = thermal_raw       / 1000.0 if thermal_raw       is not None else None
+                    not_specified = not_specified_raw / 1000.0 if not_specified_raw is not None else None
+
+                    def _check_types(col, val):
+                        if val is None:
+                            return None
+                        recent = get_recent_values(conn, 'energy_types', col, country_code, SPIKE_WINDOW)
+                        if len(recent) < SPIKE_MIN_WINDOW:
+                            return val
+                        if is_spike(val, recent, SPIKE_THRESHOLD, SPIKE_REL_THRESHOLD):
+                            logger.warning(
+                                f"Spike discarded: energy_types.{col}={val:.3f} GW "
+                                f"for {country_code} (window mean={sum(recent)/len(recent):.3f} GW)"
+                            )
+                            return None
+                        return val
+
+                    nuclear       = _check_types('nuclear',       nuclear)
+                    hydro         = _check_types('hydro',         hydro)
+                    wind          = _check_types('wind',          wind)
+                    thermal       = _check_types('thermal',       thermal)
+                    not_specified = _check_types('not_specified', not_specified)
+
+                    cursor.execute('''
+                        INSERT OR REPLACE INTO energy_types
+                        (timestamp, country, nuclear, hydro, wind, thermal, not_specified)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ''', (timestamp, country_code, nuclear, hydro, wind, thermal, not_specified))
 
             conn.commit()
             last_fetch_time = datetime.now(timezone.utc)
