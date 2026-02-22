@@ -81,7 +81,8 @@ for _country, _zones in COUNTRY_ZONES.items():
 VALID_ZONES = frozenset(ZONE_TO_COUNTRY.keys())
 VALID_ENERGY_TYPES = frozenset(['nuclear', 'hydro', 'wind', 'thermal', 'not_specified'])
 
-# Spike / false-zero rejection thresholds (tunable via env vars)
+# Spike / false-zero filtering at read time (tunable via env vars)
+SPIKE_FILTER_ENABLED    = os.environ.get('SPIKE_FILTER_ENABLED', 'true').lower() == 'true'
 SPIKE_MAX_DROP_FRACTION = float(os.environ.get('SPIKE_MAX_DROP_FRACTION', '0.70'))
 SPIKE_MAX_RISE_FRACTION = float(os.environ.get('SPIKE_MAX_RISE_FRACTION', '1.00'))
 SPIKE_WINDOW            = int(os.environ.get('SPIKE_WINDOW', '6'))       # last 6 readings ≈ 30 min
@@ -599,24 +600,43 @@ def parse_value(value):
         return None
 
 
-def _get_recent_median(cursor, table, country, field, n):
-    """Return median of the last n non-NULL stored GW values for country+field.
+def _filter_spike_series(values):
+    """Filter a list of GW values, replacing implausible readings with None.
 
-    Returns None if fewer than 2 rows found (insufficient history to establish
-    a meaningful reference). table and field are always internal constants,
-    never user input.
+    Uses a forward-iterating clean rolling window as the reference median.
+    Only accepted values enter the window, so multiple consecutive bad readings
+    from Statnett cannot corrupt the reference.
+
+    Returns the list unchanged when SPIKE_FILTER_ENABLED is False, allowing
+    raw unfiltered data to be inspected in the charts.
     """
-    cursor.execute(
-        f'SELECT {field} FROM {table} WHERE country = ? AND {field} IS NOT NULL '
-        f'ORDER BY timestamp DESC LIMIT ?',
-        (country, n)
-    )
-    vals = [row[field] for row in cursor.fetchall()]
-    if len(vals) < 2:
-        return None
-    vals.sort()
-    mid = len(vals) // 2
-    return vals[mid] if len(vals) % 2 == 1 else (vals[mid - 1] + vals[mid]) / 2.0
+    if not SPIKE_FILTER_ENABLED:
+        return list(values)
+
+    clean_window = []   # rolling window of accepted GW values
+    result = []
+    for val in values:
+        if val is None:
+            result.append(None)
+            continue
+
+        # Build reference median from the clean window
+        ref = None
+        if len(clean_window) >= 2:
+            sorted_w = sorted(clean_window)
+            mid = len(sorted_w) // 2
+            ref = sorted_w[mid] if len(sorted_w) % 2 == 1 \
+                else (sorted_w[mid - 1] + sorted_w[mid]) / 2.0
+
+        if _is_plausible(val, ref):
+            result.append(val)
+            clean_window.append(val)
+            if len(clean_window) > SPIKE_WINDOW:
+                clean_window.pop(0)
+        else:
+            result.append(None)     # replace implausible value with a chart gap
+
+    return result
 
 
 def _is_plausible(new_val_gw, ref_median_gw):
@@ -671,7 +691,7 @@ def fetch_and_store_data():
             cursor = conn.cursor()
 
             for country_code in COUNTRIES.keys():
-                # --- Parse raw MW values from API (None = missing/invalid) ---
+                # Parse raw MW values — None only for truly missing/invalid API fields
                 consumption_raw = parse_value(
                     get_item(data.get("ConsumptionData", []), "titleTranslationId",
                             f"ProductionConsumption.Consumption{country_code}Desc").get("value")
@@ -689,38 +709,17 @@ def fetch_and_store_data():
                              f"ProductionConsumption.NetExchange{country_code}Desc").get("value")
                 )
 
-                # --- Convert to GW for status fields ---
+                # Convert to GW (None stays None; explicit 0 from API stored as 0.0)
                 production_gw  = production_raw  / 1000.0 if production_raw  is not None else None
                 consumption_gw = consumption_raw / 1000.0 if consumption_raw is not None else None
 
-                # Exchange is a net value that can legitimately swing through zero
-                # (positive = import, negative = export). Skip plausibility check.
+                # Exchange is a net value; split into directional import/export
                 if exchange_raw is not None:
                     import_val = exchange_raw / 1000.0 if exchange_raw >= 0 else 0.0
                     export_val = abs(exchange_raw) / 1000.0 if exchange_raw < 0 else 0.0
                 else:
                     import_val = None
                     export_val = None
-
-                # --- Plausibility gate for production and consumption ---
-                ref_prod = _get_recent_median(
-                    cursor, 'energy_status', country_code, 'production', SPIKE_WINDOW)
-                ref_cons = _get_recent_median(
-                    cursor, 'energy_status', country_code, 'consumption', SPIKE_WINDOW)
-
-                if not _is_plausible(production_gw, ref_prod):
-                    logger.warning(
-                        f"Spike rejected [energy_status] country={country_code} "
-                        f"field=production new={production_gw} ref_median={ref_prod}"
-                    )
-                    production_gw = None
-
-                if not _is_plausible(consumption_gw, ref_cons):
-                    logger.warning(
-                        f"Spike rejected [energy_status] country={country_code} "
-                        f"field=consumption new={consumption_gw} ref_median={ref_cons}"
-                    )
-                    consumption_gw = None
 
                 cursor.execute('''
                     INSERT OR REPLACE INTO energy_status
@@ -729,49 +728,28 @@ def fetch_and_store_data():
                 ''', (timestamp, country_code, production_gw, consumption_gw,
                       import_val, export_val))
 
-                # --- Parse and validate energy type fields ---
-                nuclear_raw       = parse_value(get_item(data.get("NuclearData", []), "titleTranslationId",
-                                        f"ProductionConsumption.Nuclear{country_code}Desc").get("value"))
-                hydro_raw         = parse_value(get_item(data.get("HydroData", []), "titleTranslationId",
-                                        f"ProductionConsumption.Hydro{country_code}Desc").get("value"))
-                wind_raw          = parse_value(get_item(data.get("WindData", []), "titleTranslationId",
-                                        f"ProductionConsumption.Wind{country_code}Desc").get("value"))
-                thermal_raw       = parse_value(get_item(data.get("ThermalData", []), "titleTranslationId",
-                                        f"ProductionConsumption.Thermal{country_code}Desc").get("value"))
-                not_specified_raw = parse_value(get_item(data.get("NotSpecifiedData", []), "titleTranslationId",
-                                        f"ProductionConsumption.NotSpecified{country_code}Desc").get("value"))
-
-                type_fields_raw = [
-                    ('nuclear',       nuclear_raw),
-                    ('hydro',         hydro_raw),
-                    ('wind',          wind_raw),
-                    ('thermal',       thermal_raw),
-                    ('not_specified', not_specified_raw),
-                ]
-                checked_types = {}
-                for field_name, raw_mw in type_fields_raw:
-                    gw = raw_mw / 1000.0 if raw_mw is not None else None
-                    ref = _get_recent_median(
-                        cursor, 'energy_types', country_code, field_name, SPIKE_WINDOW)
-                    if not _is_plausible(gw, ref):
-                        logger.warning(
-                            f"Spike rejected [energy_types] country={country_code} "
-                            f"field={field_name} new={gw} ref_median={ref}"
-                        )
-                        checked_types[field_name] = None
-                    else:
-                        checked_types[field_name] = gw
+                # Parse energy type fields — store exactly what Statnett sends
+                nuclear_gw = parse_value(get_item(data.get("NuclearData", []), "titleTranslationId",
+                                f"ProductionConsumption.Nuclear{country_code}Desc").get("value"))
+                hydro_gw = parse_value(get_item(data.get("HydroData", []), "titleTranslationId",
+                                f"ProductionConsumption.Hydro{country_code}Desc").get("value"))
+                wind_gw = parse_value(get_item(data.get("WindData", []), "titleTranslationId",
+                                f"ProductionConsumption.Wind{country_code}Desc").get("value"))
+                thermal_gw = parse_value(get_item(data.get("ThermalData", []), "titleTranslationId",
+                                f"ProductionConsumption.Thermal{country_code}Desc").get("value"))
+                not_specified_gw = parse_value(get_item(data.get("NotSpecifiedData", []), "titleTranslationId",
+                                f"ProductionConsumption.NotSpecified{country_code}Desc").get("value"))
 
                 cursor.execute('''
                     INSERT OR REPLACE INTO energy_types
                     (timestamp, country, nuclear, hydro, wind, thermal, not_specified)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
                 ''', (timestamp, country_code,
-                      checked_types['nuclear'],
-                      checked_types['hydro'],
-                      checked_types['wind'],
-                      checked_types['thermal'],
-                      checked_types['not_specified']))
+                      nuclear_gw       / 1000.0 if nuclear_gw       is not None else None,
+                      hydro_gw         / 1000.0 if hydro_gw         is not None else None,
+                      wind_gw          / 1000.0 if wind_gw          is not None else None,
+                      thermal_gw       / 1000.0 if thermal_gw       is not None else None,
+                      not_specified_gw / 1000.0 if not_specified_gw is not None else None))
 
             conn.commit()
             last_fetch_time = datetime.now(timezone.utc)
@@ -1037,12 +1015,17 @@ def get_status(country):
         ''', (country, start_date, row_limit))
         rows = cursor.fetchall()
 
+    # Apply spike filter at read time — raw values are preserved in the DB
+    prod_filtered = _filter_spike_series([row['production']   for row in rows])
+    cons_filtered = _filter_spike_series([row['consumption']  for row in rows])
+    # import/export (net exchange) can legitimately be near zero — no filter
+
     data = []
-    for row in rows:
+    for i, row in enumerate(rows):
         data.append({
             'timestamp': format_timestamp(row['timestamp']),
-            'production': row['production'],
-            'consumption': row['consumption'],
+            'production': prod_filtered[i],
+            'consumption': cons_filtered[i],
             'import': row['import_value'],
             'export': row['export_value']
         })
@@ -1075,15 +1058,22 @@ def get_types(country):
         ''', (country, start_date, row_limit))
         rows = cursor.fetchall()
 
+    # Apply spike filter at read time — raw values are preserved in the DB
+    nuclear_f       = _filter_spike_series([row['nuclear']       for row in rows])
+    hydro_f         = _filter_spike_series([row['hydro']         for row in rows])
+    wind_f          = _filter_spike_series([row['wind']          for row in rows])
+    thermal_f       = _filter_spike_series([row['thermal']       for row in rows])
+    not_specified_f = _filter_spike_series([row['not_specified'] for row in rows])
+
     data = []
-    for row in rows:
+    for i, row in enumerate(rows):
         data.append({
             'timestamp': format_timestamp(row['timestamp']),
-            'nuclear': row['nuclear'],
-            'hydro': row['hydro'],
-            'wind': row['wind'],
-            'thermal': row['thermal'],
-            'not_specified': row['not_specified']
+            'nuclear':       nuclear_f[i],
+            'hydro':         hydro_f[i],
+            'wind':          wind_f[i],
+            'thermal':       thermal_f[i],
+            'not_specified': not_specified_f[i]
         })
 
     return jsonify({
