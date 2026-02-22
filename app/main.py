@@ -5,7 +5,7 @@ Security-hardened version for production deployment
 Includes Nordpool spot price correlation analysis
 """
 
-__version__ = "1.8"
+__version__ = "1.9"
 
 import os
 import sys
@@ -80,6 +80,12 @@ for _country, _zones in COUNTRY_ZONES.items():
 
 VALID_ZONES = frozenset(ZONE_TO_COUNTRY.keys())
 VALID_ENERGY_TYPES = frozenset(['nuclear', 'hydro', 'wind', 'thermal', 'not_specified'])
+
+# Spike / false-zero rejection thresholds (tunable via env vars)
+SPIKE_MAX_DROP_FRACTION = float(os.environ.get('SPIKE_MAX_DROP_FRACTION', '0.70'))
+SPIKE_MAX_RISE_FRACTION = float(os.environ.get('SPIKE_MAX_RISE_FRACTION', '1.00'))
+SPIKE_WINDOW            = int(os.environ.get('SPIKE_WINDOW', '6'))       # last 6 readings ≈ 30 min
+SPIKE_MIN_REFERENCE_MW  = float(os.environ.get('SPIKE_MIN_REFERENCE_MW', '500.0'))
 
 # =============================================================================
 # LOGGING SETUP
@@ -581,19 +587,55 @@ def get_item(collection, key, target):
 
 
 def parse_value(value):
-    """Safely parse a numeric value. Returns None if missing or invalid."""
+    """Parse a raw API value to float (MW), or None if absent/invalid."""
     if value is None:
         return None
     if isinstance(value, (int, float)):
         return None if value != value else float(value)   # NaN → None
     try:
         cleaned = str(value).encode('ascii', 'ignore').decode('ascii').strip()
-        if not cleaned:
-            return None
-        result = float(cleaned)
-        return None if result != result else result        # NaN after conversion → None
+        return float(cleaned) if cleaned else None
     except (ValueError, AttributeError):
         return None
+
+
+def _get_recent_median(cursor, table, country, field, n):
+    """Return median of the last n non-NULL stored GW values for country+field.
+
+    Returns None if fewer than 2 rows found (insufficient history to establish
+    a meaningful reference). table and field are always internal constants,
+    never user input.
+    """
+    cursor.execute(
+        f'SELECT {field} FROM {table} WHERE country = ? AND {field} IS NOT NULL '
+        f'ORDER BY timestamp DESC LIMIT ?',
+        (country, n)
+    )
+    vals = [row[field] for row in cursor.fetchall()]
+    if len(vals) < 2:
+        return None
+    vals.sort()
+    mid = len(vals) // 2
+    return vals[mid] if len(vals) % 2 == 1 else (vals[mid - 1] + vals[mid]) / 2.0
+
+
+def _is_plausible(new_val_gw, ref_median_gw):
+    """Return True if new_val_gw is plausible given the recent stored median.
+
+    Rejects:  None values (missing data), drops >SPIKE_MAX_DROP_FRACTION below
+              reference, rises >SPIKE_MAX_RISE_FRACTION above reference.
+    Accepts:  No reference yet (first-run), reference < SPIKE_MIN_REFERENCE_MW
+              (legitimately near-zero sources like DK nuclear), or within bands.
+    """
+    if new_val_gw is None:
+        return False
+    if ref_median_gw is None:
+        return True
+    if ref_median_gw * 1000.0 < SPIKE_MIN_REFERENCE_MW:
+        return True
+    lower = ref_median_gw * (1.0 - SPIKE_MAX_DROP_FRACTION)
+    upper = ref_median_gw * (1.0 + SPIKE_MAX_RISE_FRACTION)
+    return lower <= new_val_gw <= upper
 
 
 STATNETT_API_RETRIES = 3
@@ -629,8 +671,11 @@ def fetch_and_store_data():
             cursor = conn.cursor()
 
             for country_code in COUNTRIES.keys():
-
-                # ── energy_status ─────────────────────────────────────────────
+                # --- Parse raw MW values from API (None = missing/invalid) ---
+                consumption_raw = parse_value(
+                    get_item(data.get("ConsumptionData", []), "titleTranslationId",
+                            f"ProductionConsumption.Consumption{country_code}Desc").get("value")
+                )
                 production_raw = parse_value(
                     get_item(data.get("ProductionData", []), "titleTranslationId",
                              f"ProductionConsumption.Production{country_code}Desc").get("value")
@@ -644,106 +689,89 @@ def fetch_and_store_data():
                              f"ProductionConsumption.NetExchange{country_code}Desc").get("value")
                 )
 
-                if production_raw is None and consumption_raw is None and exchange_raw is None:
-                    logger.warning(
-                        f"All energy_status fields None for {country_code} at {timestamp}, skipping row"
-                    )
+                # --- Convert to GW for status fields ---
+                production_gw  = production_raw  / 1000.0 if production_raw  is not None else None
+                consumption_gw = consumption_raw / 1000.0 if consumption_raw is not None else None
+
+                # Exchange is a net value that can legitimately swing through zero
+                # (positive = import, negative = export). Skip plausibility check.
+                if exchange_raw is not None:
+                    import_val = exchange_raw / 1000.0 if exchange_raw >= 0 else 0.0
+                    export_val = abs(exchange_raw) / 1000.0 if exchange_raw < 0 else 0.0
                 else:
-                    # Scale to GW (matching stored units) before spike comparison
-                    production  = production_raw  / 1000.0 if production_raw  is not None else None
-                    consumption = consumption_raw / 1000.0 if consumption_raw is not None else None
-                    if exchange_raw is not None:
-                        ex = exchange_raw / 1000.0
-                        import_val = ex       if ex >= 0 else 0.0
-                        export_val = abs(ex)  if ex <  0 else 0.0
+                    import_val = None
+                    export_val = None
+
+                # --- Plausibility gate for production and consumption ---
+                ref_prod = _get_recent_median(
+                    cursor, 'energy_status', country_code, 'production', SPIKE_WINDOW)
+                ref_cons = _get_recent_median(
+                    cursor, 'energy_status', country_code, 'consumption', SPIKE_WINDOW)
+
+                if not _is_plausible(production_gw, ref_prod):
+                    logger.warning(
+                        f"Spike rejected [energy_status] country={country_code} "
+                        f"field=production new={production_gw} ref_median={ref_prod}"
+                    )
+                    production_gw = None
+
+                if not _is_plausible(consumption_gw, ref_cons):
+                    logger.warning(
+                        f"Spike rejected [energy_status] country={country_code} "
+                        f"field=consumption new={consumption_gw} ref_median={ref_cons}"
+                    )
+                    consumption_gw = None
+
+                cursor.execute('''
+                    INSERT OR REPLACE INTO energy_status
+                    (timestamp, country, production, consumption, import_value, export_value)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (timestamp, country_code, production_gw, consumption_gw,
+                      import_val, export_val))
+
+                # --- Parse and validate energy type fields ---
+                nuclear_raw       = parse_value(get_item(data.get("NuclearData", []), "titleTranslationId",
+                                        f"ProductionConsumption.Nuclear{country_code}Desc").get("value"))
+                hydro_raw         = parse_value(get_item(data.get("HydroData", []), "titleTranslationId",
+                                        f"ProductionConsumption.Hydro{country_code}Desc").get("value"))
+                wind_raw          = parse_value(get_item(data.get("WindData", []), "titleTranslationId",
+                                        f"ProductionConsumption.Wind{country_code}Desc").get("value"))
+                thermal_raw       = parse_value(get_item(data.get("ThermalData", []), "titleTranslationId",
+                                        f"ProductionConsumption.Thermal{country_code}Desc").get("value"))
+                not_specified_raw = parse_value(get_item(data.get("NotSpecifiedData", []), "titleTranslationId",
+                                        f"ProductionConsumption.NotSpecified{country_code}Desc").get("value"))
+
+                type_fields_raw = [
+                    ('nuclear',       nuclear_raw),
+                    ('hydro',         hydro_raw),
+                    ('wind',          wind_raw),
+                    ('thermal',       thermal_raw),
+                    ('not_specified', not_specified_raw),
+                ]
+                checked_types = {}
+                for field_name, raw_mw in type_fields_raw:
+                    gw = raw_mw / 1000.0 if raw_mw is not None else None
+                    ref = _get_recent_median(
+                        cursor, 'energy_types', country_code, field_name, SPIKE_WINDOW)
+                    if not _is_plausible(gw, ref):
+                        logger.warning(
+                            f"Spike rejected [energy_types] country={country_code} "
+                            f"field={field_name} new={gw} ref_median={ref}"
+                        )
+                        checked_types[field_name] = None
                     else:
-                        import_val = None
-                        export_val = None
+                        checked_types[field_name] = gw
 
-                    def _check_status(col, val):
-                        if val is None:
-                            return None
-                        recent = get_recent_values(conn, 'energy_status', col, country_code, SPIKE_WINDOW)
-                        if len(recent) < SPIKE_MIN_WINDOW:
-                            return val
-                        if is_spike(val, recent, SPIKE_THRESHOLD, SPIKE_REL_THRESHOLD):
-                            logger.warning(
-                                f"Spike discarded: energy_status.{col}={val:.3f} GW "
-                                f"for {country_code} (window mean={sum(recent)/len(recent):.3f} GW)"
-                            )
-                            return None
-                        return val
-
-                    production  = _check_status('production',   production)
-                    consumption = _check_status('consumption',  consumption)
-                    import_val  = _check_status('import_value', import_val)
-                    export_val  = _check_status('export_value', export_val)
-
-                    cursor.execute('''
-                        INSERT OR REPLACE INTO energy_status
-                        (timestamp, country, production, consumption, import_value, export_value)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                    ''', (timestamp, country_code, production, consumption, import_val, export_val))
-
-                # ── energy_types ──────────────────────────────────────────────
-                nuclear_raw = parse_value(
-                    get_item(data.get("NuclearData", []), "titleTranslationId",
-                             f"ProductionConsumption.Nuclear{country_code}Desc").get("value")
-                )
-                hydro_raw = parse_value(
-                    get_item(data.get("HydroData", []), "titleTranslationId",
-                             f"ProductionConsumption.Hydro{country_code}Desc").get("value")
-                )
-                wind_raw = parse_value(
-                    get_item(data.get("WindData", []), "titleTranslationId",
-                             f"ProductionConsumption.Wind{country_code}Desc").get("value")
-                )
-                thermal_raw = parse_value(
-                    get_item(data.get("ThermalData", []), "titleTranslationId",
-                             f"ProductionConsumption.Thermal{country_code}Desc").get("value")
-                )
-                not_specified_raw = parse_value(
-                    get_item(data.get("NotSpecifiedData", []), "titleTranslationId",
-                             f"ProductionConsumption.NotSpecified{country_code}Desc").get("value")
-                )
-
-                if all(v is None for v in [nuclear_raw, hydro_raw, wind_raw, thermal_raw, not_specified_raw]):
-                    logger.warning(
-                        f"All energy_types fields None for {country_code} at {timestamp}, skipping row"
-                    )
-                else:
-                    # Scale to GW before spike comparison
-                    nuclear       = nuclear_raw       / 1000.0 if nuclear_raw       is not None else None
-                    hydro         = hydro_raw         / 1000.0 if hydro_raw         is not None else None
-                    wind          = wind_raw          / 1000.0 if wind_raw          is not None else None
-                    thermal       = thermal_raw       / 1000.0 if thermal_raw       is not None else None
-                    not_specified = not_specified_raw / 1000.0 if not_specified_raw is not None else None
-
-                    def _check_types(col, val):
-                        if val is None:
-                            return None
-                        recent = get_recent_values(conn, 'energy_types', col, country_code, SPIKE_WINDOW)
-                        if len(recent) < SPIKE_MIN_WINDOW:
-                            return val
-                        if is_spike(val, recent, SPIKE_THRESHOLD, SPIKE_REL_THRESHOLD):
-                            logger.warning(
-                                f"Spike discarded: energy_types.{col}={val:.3f} GW "
-                                f"for {country_code} (window mean={sum(recent)/len(recent):.3f} GW)"
-                            )
-                            return None
-                        return val
-
-                    nuclear       = _check_types('nuclear',       nuclear)
-                    hydro         = _check_types('hydro',         hydro)
-                    wind          = _check_types('wind',          wind)
-                    thermal       = _check_types('thermal',       thermal)
-                    not_specified = _check_types('not_specified', not_specified)
-
-                    cursor.execute('''
-                        INSERT OR REPLACE INTO energy_types
-                        (timestamp, country, nuclear, hydro, wind, thermal, not_specified)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ''', (timestamp, country_code, nuclear, hydro, wind, thermal, not_specified))
+                cursor.execute('''
+                    INSERT OR REPLACE INTO energy_types
+                    (timestamp, country, nuclear, hydro, wind, thermal, not_specified)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (timestamp, country_code,
+                      checked_types['nuclear'],
+                      checked_types['hydro'],
+                      checked_types['wind'],
+                      checked_types['thermal'],
+                      checked_types['not_specified']))
 
             conn.commit()
             last_fetch_time = datetime.now(timezone.utc)
@@ -1013,10 +1041,10 @@ def get_status(country):
     for row in rows:
         data.append({
             'timestamp': format_timestamp(row['timestamp']),
-            'production': row['production'] or 0,
-            'consumption': row['consumption'] or 0,
-            'import': row['import_value'] or 0,
-            'export': row['export_value'] or 0
+            'production': row['production'],
+            'consumption': row['consumption'],
+            'import': row['import_value'],
+            'export': row['export_value']
         })
 
     return jsonify({
@@ -1051,11 +1079,11 @@ def get_types(country):
     for row in rows:
         data.append({
             'timestamp': format_timestamp(row['timestamp']),
-            'nuclear': row['nuclear'] or 0,
-            'hydro': row['hydro'] or 0,
-            'wind': row['wind'] or 0,
-            'thermal': row['thermal'] or 0,
-            'not_specified': row['not_specified'] or 0
+            'nuclear': row['nuclear'],
+            'hydro': row['hydro'],
+            'wind': row['wind'],
+            'thermal': row['thermal'],
+            'not_specified': row['not_specified']
         })
 
     return jsonify({

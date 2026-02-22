@@ -105,6 +105,7 @@ const lineChartOptions = {
     responsive: true,
     maintainAspectRatio: false,
     interaction: { mode: 'index', intersect: false },
+    spanGaps: false,
     plugins: {
         legend: { display: false },
         datalabels: { display: false },
@@ -118,7 +119,7 @@ const lineChartOptions = {
             displayColors: true,
             callbacks: {
                 label: function(context) {
-                    return `${context.dataset.label}: ${context.parsed.y?.toFixed(2) || 0} GW`;
+                    return `${context.dataset.label}: ${context.parsed.y != null ? context.parsed.y.toFixed(2) : '–'} GW`;
                 }
             }
         }
@@ -273,6 +274,7 @@ function cloneChartOptions(base) {
         responsive: base.responsive,
         maintainAspectRatio: base.maintainAspectRatio,
         interaction: base.interaction,
+        spanGaps: base.spanGaps,
         scales: {
             x: { ...base.scales.x, time: { ...base.scales.x.time, displayFormats: { ...base.scales.x.time.displayFormats } }, grid: { ...base.scales.x.grid }, ticks: { maxTicksLimit: base.scales.x.ticks.maxTicksLimit } },
             y: { beginAtZero: base.scales.y.beginAtZero, grid: { ...base.scales.y.grid } }
@@ -796,10 +798,10 @@ async function loadData() {
                         for (const d of statusData.data) {
                             const date = parseTimestamp(d.timestamp);
                             if (date) {
-                                productionData.push({ x: date, y: d.production || 0 });
-                                consumptionData.push({ x: date, y: d.consumption || 0 });
-                                importData.push({ x: date, y: d.import || 0 });
-                                exportData.push({ x: date, y: d.export || 0 });
+                                productionData.push({ x: date, y: d.production ?? null });
+                                consumptionData.push({ x: date, y: d.consumption ?? null });
+                                importData.push({ x: date, y: d.import ?? null });
+                                exportData.push({ x: date, y: d.export ?? null });
                             }
                         }
 
@@ -827,11 +829,11 @@ async function loadData() {
                         for (const d of typesData.data) {
                             const date = parseTimestamp(d.timestamp);
                             if (date) {
-                                nuclearData.push({ x: date, y: d.nuclear || 0 });
-                                hydroData.push({ x: date, y: d.hydro || 0 });
-                                windData.push({ x: date, y: d.wind || 0 });
-                                thermalData.push({ x: date, y: d.thermal || 0 });
-                                otherData.push({ x: date, y: d.not_specified || 0 });
+                                nuclearData.push({ x: date, y: d.nuclear ?? null });
+                                hydroData.push({ x: date, y: d.hydro ?? null });
+                                windData.push({ x: date, y: d.wind ?? null });
+                                thermalData.push({ x: date, y: d.thermal ?? null });
+                                otherData.push({ x: date, y: d.not_specified ?? null });
                             }
                         }
 
