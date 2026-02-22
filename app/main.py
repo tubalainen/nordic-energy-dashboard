@@ -33,6 +33,12 @@ FETCH_INTERVAL_MINUTES = int(os.environ.get('FETCH_INTERVAL', 5))
 DATA_RETENTION_DAYS = int(os.environ.get('DATA_RETENTION_DAYS', 200))
 LOG_LEVEL = os.environ.get('LOG_LEVEL', 'WARNING').upper()
 
+# Spike filter (applied to Statnett energy data at write time)
+SPIKE_WINDOW        = int(os.environ.get('SPIKE_WINDOW', 12))       # rolling window size (~1 hour at 5-min fetch)
+SPIKE_THRESHOLD     = float(os.environ.get('SPIKE_THRESHOLD', 3.0)) # sigma multiplier for std-based detection
+SPIKE_MIN_WINDOW    = int(os.environ.get('SPIKE_MIN_WINDOW', 6))    # min readings before filtering activates
+SPIKE_REL_THRESHOLD = float(os.environ.get('SPIKE_REL_THRESHOLD', 0.5))  # % deviation threshold when std=0
+
 # Security settings
 ENABLE_DEBUG_ENDPOINTS = os.environ.get('ENABLE_DEBUG_ENDPOINTS', 'false').lower() == 'true'
 RATE_LIMIT_DEFAULT = os.environ.get('RATE_LIMIT_DEFAULT', '100 per minute')
@@ -325,6 +331,50 @@ def interpret_correlation(r):
 
 
 # =============================================================================
+# SPIKE FILTER
+# =============================================================================
+
+def get_recent_values(conn, table, column, country, n):
+    """Return up to n most-recent non-NULL stored values for a column/country pair.
+
+    Uses an already-open connection so it participates in the caller's transaction.
+    table and column are always string literals from fetch_and_store_data — never
+    from user input — so the f-string interpolation is safe here.
+    """
+    cursor = conn.cursor()
+    cursor.execute(
+        f'SELECT {column} FROM {table} '
+        f'WHERE country = ? AND {column} IS NOT NULL '
+        f'ORDER BY timestamp DESC LIMIT ?',
+        (country, n)
+    )
+    return [float(row[0]) for row in cursor.fetchall()]
+
+
+def is_spike(new_val, recent_vals, threshold, rel_threshold):
+    """Return True if new_val is a statistical outlier relative to recent_vals.
+
+    Two-mode detection:
+      std > 0  →  sigma-based:    flag if abs(new - mean) > threshold * std
+      std == 0 and mean > 0  →  percentage-based: flag if |deviation| / mean > rel_threshold
+      std == 0 and mean == 0  →  accept (zero baseline, cannot determine)
+    """
+    n = len(recent_vals)
+    mean = sum(recent_vals) / n
+    variance = sum((v - mean) ** 2 for v in recent_vals) / n
+    std = math.sqrt(variance)
+
+    if std > 0.0:
+        return abs(new_val - mean) > threshold * std
+
+    # Constant baseline fallback: use relative deviation
+    if mean > 0.0:
+        return abs(new_val - mean) / mean > rel_threshold
+
+    return False  # Zero baseline — cannot classify, accept
+
+
+# =============================================================================
 # DATABASE
 # =============================================================================
 
@@ -541,7 +591,7 @@ def parse_value(value):
     if value is None:
         return None
     if isinstance(value, (int, float)):
-        return float(value)
+        return None if value != value else float(value)   # NaN → None
     try:
         cleaned = str(value).encode('ascii', 'ignore').decode('ascii').strip()
         return float(cleaned) if cleaned else None
@@ -592,7 +642,7 @@ STATNETT_API_RETRIES = 3
 
 
 def fetch_and_store_data():
-    """Fetch data from Statnett API"""
+    """Fetch data from Statnett API and store, discarding statistical spikes."""
     global last_fetch_time, last_fetch_status
 
     logger.info("Fetching data from Statnett API...")
@@ -628,11 +678,15 @@ def fetch_and_store_data():
                 )
                 production_raw = parse_value(
                     get_item(data.get("ProductionData", []), "titleTranslationId",
-                            f"ProductionConsumption.Production{country_code}Desc").get("value")
+                             f"ProductionConsumption.Production{country_code}Desc").get("value")
+                )
+                consumption_raw = parse_value(
+                    get_item(data.get("ConsumptionData", []), "titleTranslationId",
+                             f"ProductionConsumption.Consumption{country_code}Desc").get("value")
                 )
                 exchange_raw = parse_value(
                     get_item(data.get("NetExchangeData", []), "titleTranslationId",
-                            f"ProductionConsumption.NetExchange{country_code}Desc").get("value")
+                             f"ProductionConsumption.NetExchange{country_code}Desc").get("value")
                 )
 
                 # --- Convert to GW for status fields ---
