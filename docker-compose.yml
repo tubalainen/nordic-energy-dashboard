@@ -30,6 +30,13 @@ services:
       - RATE_LIMIT_API=30 per minute
       # Timezone
       - TZ=Europe/Stockholm
+      # Spike filter — applied at read time, raw data always preserved in DB
+      # Set SPIKE_FILTER_ENABLED=false to see raw Statnett data for debugging
+      - SPIKE_FILTER_ENABLED=true
+      - SPIKE_MAX_DROP_FRACTION=0.70    # reject if value drops >70% vs rolling median
+      - SPIKE_MAX_RISE_FRACTION=1.00    # reject if value rises >100% vs rolling median
+      - SPIKE_WINDOW=6                  # rolling window size (6 × 5 min = 30 min)
+      - SPIKE_MIN_REFERENCE_MW=500.0    # skip check if reference median is below this (MW)
     # Security: Read-only root filesystem
     read_only: true
     tmpfs:
